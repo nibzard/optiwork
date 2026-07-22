@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/optikit",
+    "crates/optikit-paired",
+    "crates/optikit-campaign",
+    "crates/regexbench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/nibzard/optiwork"
+
+[profile.release]
+debug = false
+lto = "fat"
+codegen-units = 1
+panic = "abort"

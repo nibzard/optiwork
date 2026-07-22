@@ -1,0 +1,10 @@
+[package]
+name = "optikit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generic optimization-measurement harness: versioned records, paired A/B scheduling, and statistics"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,27 @@
+[package]
+name = "regexbench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Regex-engine demo subject for optiwork: naive, Thompson NFA, Pike VM, cached DFA, SIMD-prefix impls"
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "bench"
+
+[[example]]
+name = "gen_golden"
+required-features = ["oracle"]
+
+[features]
+oracle = ["dep:regex"]
+
+[dependencies]
+memchr = "2.8"
+regex = { version = "1", optional = true }
+
+[dev-dependencies]
+regex = "1"

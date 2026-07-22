@@ -1,0 +1,14 @@
+[package]
+name = "optikit-paired"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generic paired A/B and A/A runner for any subject bench binary that speaks the optiwork-fixed-v1 protocol"
+
+[[bin]]
+name = "optikit-paired"
+path = "src/main.rs"
+
+[dependencies]
+optikit = { path = "../optikit" }
