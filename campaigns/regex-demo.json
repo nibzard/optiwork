@@ -1,0 +1,73 @@
+{
+  "version": "optiwork-campaign-v1",
+  "id": "regex-demo",
+  "paired": "target/release/optikit-paired",
+  "measure": "scan",
+  "environment": {},
+  "limits": {
+    "gate_timeout_ms": 300000,
+    "subject_timeout_ms": 300000,
+    "paired_timeout_ms": 43200000,
+    "max_output_bytes": 16777216
+  },
+  "max_candidates": 2,
+  "baseline": {
+    "id": "naive",
+    "binary": "target/release/optiwork-artifacts/regex-naive-bench",
+    "args": ["--impl", "naive"]
+  },
+  "candidates": [
+    {
+      "id": "thompson",
+      "binary": "target/release/optiwork-artifacts/regex-thompson-bench",
+      "args": ["--impl", "thompson"],
+      "hypothesis": "A Pike VM bounds the live-thread set and removes exponential retry on alternation."
+    },
+    {
+      "id": "prefilter",
+      "binary": "target/release/optiwork-artifacts/regex-prefilter-bench",
+      "args": ["--impl", "prefilter"],
+      "hypothesis": "A SIMD literal-prefix scan jumps to candidate starts, followed by anchored linear verification."
+    }
+  ],
+  "workloads": [
+    {
+      "id": "main",
+      "args": ["--corpus", "corpora/main.bin"],
+      "gate_args": ["--check", "corpora/main.golden", "--corpus", "corpora/main.bin"],
+      "artifacts": ["corpora/main.bin", "corpora/main.golden"],
+      "count": 8377,
+      "sessions": 30,
+      "calibration_blocks": 8,
+      "min_blocks": 8,
+      "max_blocks": 32
+    },
+    {
+      "id": "pathological",
+      "args": ["--corpus", "corpora/pathological.bin"],
+      "gate_args": ["--check", "corpora/pathological.golden", "--corpus", "corpora/pathological.bin"],
+      "artifacts": ["corpora/pathological.bin", "corpora/pathological.golden"],
+      "count": 150,
+      "sessions": 3,
+      "calibration_blocks": 8,
+      "min_blocks": 6,
+      "max_blocks": 24
+    }
+  ],
+  "calibration": {
+    "order_seed": 731,
+    "seeds": [101, 202, 303],
+    "target_speedup_percent": 3.0
+  },
+  "exploration": {
+    "order_seed": 1,
+    "seeds": [42]
+  },
+  "confirmation": {
+    "order_seed": 77,
+    "seeds": [911]
+  },
+  "decision": {
+    "min_lower_bound_ratio": 1.0
+  }
+}

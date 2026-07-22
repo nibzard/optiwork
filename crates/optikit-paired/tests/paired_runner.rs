@@ -7,24 +7,39 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// A fake optiwork subject. It echoes the requested work back as a well-formed
 /// `optiwork-fixed-v1` record with a deterministic `elapsed_ns`, so throughput
 /// ratios are exact. Tokens in `--subject-args` select misbehaviors that exercise
-/// the runner's fail-closed paths.
+/// the runner's fail-closed paths. The `protocol-only` measure rejects the legacy
+/// transport entirely so tests can verify that no `--subject-args` option was sent.
 const FAKE_SUBJECT: &str = r#"#!/bin/sh
-measure=""; seed=0; sessions=0; count=0; subject_args=""
+measure=""; seed=0; sessions=0; count=0; subject_args=""; elapsed=1000000
+stdout_bytes=0; stderr_bytes=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --measure) measure=$2; shift 2;;
     --seed) seed=$2; shift 2;;
     --sessions) sessions=$2; shift 2;;
     --count) count=$2; shift 2;;
-    --subject-args) subject_args=$2; shift 2;;
+    --subject-args)
+      if [ "$measure" = "protocol-only" ]; then
+        printf '%s\n' 'protocol-only subject received --subject-args' >&2
+        exit 64
+      fi
+      subject_args=$2
+      shift 2
+      ;;
+    --elapsed) elapsed=$2; shift 2;;
+    --sleep) sleep "$2"; shift 2;;
+    --spawn-child) sleep "$2" & descendant_pid=$!; printf '%s\n' "$descendant_pid" >> "$3"; wait "$descendant_pid"; shift 3;;
+    --stdout-bytes) stdout_bytes=$2; shift 2;;
+    --stderr-bytes) stderr_bytes=$2; shift 2;;
     *) shift;;
   esac
 done
-elapsed=1000000
 version=optiwork-fixed-v1
 for tok in $subject_args; do
   case "$tok" in
@@ -36,6 +51,10 @@ for tok in $subject_args; do
     crashonseed=*) if [ "$seed" = "${tok#crashonseed=}" ]; then exit 3; fi;;
   esac
 done
+i=0
+while [ "$i" -lt "$stdout_bytes" ]; do printf x; i=$((i + 1)); done
+i=0
+while [ "$i" -lt "$stderr_bytes" ]; do printf x >&2; i=$((i + 1)); done
 requested=$((count * sessions))
 printf '%s\tmode=%s\tseed=%s\tcount=%s\tsessions=%s\twarmup_sessions=1\trequested=%s\tcompleted=%s\tattempts=%s\telapsed_ns=%s\titems_per_second=0\toutput_bytes=0\n' \
   "$version" "$measure" "$seed" "$count" "$sessions" "$requested" "$requested" "$sessions" "$elapsed"
@@ -58,6 +77,24 @@ fn run_paired(args: &[&str]) -> (Output, String, String) {
     let stdout = String::from_utf8(output.stdout.clone()).unwrap();
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     (output, stdout, stderr)
+}
+
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal zero performs an existence/permission check and does not
+    // modify the process identified by this exact PID.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn assert_process_exits(pid: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_exists(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_exists(pid),
+        "descendant PID {pid} survived timeout"
+    );
 }
 
 #[test]
@@ -87,11 +124,11 @@ fn ab_reports_exact_speedup_with_screen_positive_evidence() {
     // in every block: zero variance, and the lower bound equals the estimate.
     assert!(stdout.contains("valid_blocks=2"), "stdout: {stdout}");
     assert!(
-        stdout.contains("speedup_ratio=2.000000"),
+        stdout.contains("speedup_ratio=2.0000000000000000e0"),
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("lower_95_one_sided_ratio=2.000000"),
+        stdout.contains("lower_95_one_sided_ratio=2.0000000000000000e0"),
         "stdout: {stdout}"
     );
     assert!(
@@ -154,6 +191,162 @@ fn aa_calibration_reports_power_sizing() {
         "stdout: {stdout}"
     );
     assert!(stdout.contains("CALIBRATION"), "stdout: {stdout}");
+}
+
+#[test]
+fn direct_arguments_are_forwarded_as_exact_argv_entries() {
+    let subject = fake_subject("direct-argv");
+    let subject = subject.to_str().unwrap();
+    let (output, stdout, stderr) = run_paired(&[
+        "--baseline",
+        subject,
+        "--candidate",
+        subject,
+        "--baseline-arg",
+        "--elapsed",
+        "--baseline-arg",
+        "200000",
+        "--candidate-arg",
+        "--elapsed",
+        "--candidate-arg",
+        "100000",
+        "--count",
+        "10",
+        "--sessions",
+        "2",
+        "--schedule",
+        "ABBA,BAAB",
+    ]);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("argument_transport=direct"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("baseline_argv=[\"--elapsed\", \"200000\"]"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("candidate_argv=[\"--elapsed\", \"100000\"]"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("speedup_ratio=2.000000"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn empty_direct_transport_omits_legacy_subject_args() {
+    let subject = fake_subject("empty-direct");
+    let subject = subject.to_str().unwrap();
+    let (output, stdout, stderr) = run_paired(&[
+        "--baseline",
+        subject,
+        "--candidate",
+        subject,
+        "--measure",
+        "protocol-only",
+        "--direct-args",
+        "--count",
+        "10",
+        "--sessions",
+        "2",
+        "--schedule",
+        "ABBA,BAAB",
+    ]);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "mode=protocol-only argument_transport=direct baseline_argv=[] candidate_argv=[]"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn subject_timeout_kills_the_run_and_fails_closed() {
+    let subject = fake_subject("timeout");
+    let pid_file = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("timeout-descendants.pids");
+    let _ = fs::remove_file(&pid_file);
+    let subject = subject.to_str().unwrap();
+    let pid_file_arg = pid_file.to_str().unwrap();
+    let (output, stdout, stderr) = run_paired(&[
+        "--baseline",
+        subject,
+        "--candidate",
+        subject,
+        "--candidate-arg",
+        "--spawn-child",
+        "--candidate-arg",
+        "30",
+        "--candidate-arg",
+        pid_file_arg,
+        "--count",
+        "10",
+        "--sessions",
+        "2",
+        "--schedule",
+        "ABBA,BAAB",
+        "--timeout-ms",
+        "250",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("timed out after 250 ms"),
+        "stderr: {stderr}"
+    );
+    assert!(stdout.contains("valid_blocks=0"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("evidence=invalid_design"),
+        "stdout: {stdout}"
+    );
+    let descendant_pids = fs::read_to_string(&pid_file)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse::<libc::pid_t>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(descendant_pids.len(), 4, "pids: {descendant_pids:?}");
+    for pid in descendant_pids {
+        assert_process_exits(pid);
+    }
+}
+
+#[test]
+fn stdout_and_stderr_capture_limits_fail_closed() {
+    let subject = fake_subject("output-limit");
+    let subject = subject.to_str().unwrap();
+    for (stream, direct_option) in [("stdout", "--stdout-bytes"), ("stderr", "--stderr-bytes")] {
+        let (output, stdout, stderr) = run_paired(&[
+            "--baseline",
+            subject,
+            "--candidate",
+            subject,
+            "--candidate-arg",
+            direct_option,
+            "--candidate-arg",
+            "1000",
+            "--count",
+            "10",
+            "--sessions",
+            "2",
+            "--schedule",
+            "ABBA,BAAB",
+            "--max-output-bytes",
+            "256",
+        ]);
+        assert!(!output.status.success());
+        assert!(
+            stdout.contains("evidence=invalid_design"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "{stream} exceeded --max-output-bytes limit of 256"
+            )),
+            "stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -288,5 +481,60 @@ fn invalid_blocks_are_dropped_never_replaced() {
     );
     assert!(stdout.contains("valid_blocks=2"), "stdout: {stdout}");
     assert!(stdout.contains("invalid_blocks=2"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("evidence=invalid_design"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("evidence=screen_positive"),
+        "stdout: {stdout}"
+    );
     assert!(stderr.contains("no runs were replaced"), "stderr: {stderr}");
+}
+
+#[test]
+fn overflowing_fixed_work_is_rejected_before_process_launch() {
+    let missing_subject = "/optikit-test-subject-that-must-not-exist";
+    let max_count = u64::MAX.to_string();
+    let (output, stdout, stderr) = run_paired(&[
+        "--baseline",
+        missing_subject,
+        "--candidate",
+        missing_subject,
+        "--count",
+        &max_count,
+        "--sessions",
+        "2",
+        "--schedule",
+        "ABBA,BAAB",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains("count times sessions overflowed"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("could not run"), "stderr: {stderr}");
+}
+
+#[test]
+fn excessive_output_limit_is_rejected_before_process_launch() {
+    let missing_subject = "/optikit-test-subject-that-must-not-exist";
+    let (output, stdout, stderr) = run_paired(&[
+        "--baseline",
+        missing_subject,
+        "--candidate",
+        missing_subject,
+        "--max-output-bytes",
+        "67108865",
+        "--schedule",
+        "ABBA,BAAB",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains("maximum output bytes must not exceed 67108864"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("could not run"), "stderr: {stderr}");
 }

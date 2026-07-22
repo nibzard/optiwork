@@ -1,195 +1,209 @@
 # Benchmark-Guided Optimization Loop
 
-Use fixed-work paired measurements for optimization decisions. The primary
-metric is **bytes scanned per second** through one implementation's `find_all`
-over a fixed `(pattern, input)` corpus: pattern compilation and process startup
-are outside the timed region; the full corpus scan is inside it.
+`optiwork` treats optimization as a campaign, not a sequence of unrelated timer
+runs. One immutable JSON specification fixes the artifacts, workloads, candidate
+order, noise calibration, decision rule, and confirmation design before the
+first candidate result is observed.
 
-`output_bytes` (total bytes covered by reported matches) is emitted as a
-diagnostic sidecar. It is not a substitute for the bytes-scanned result.
+The regex engine is only the showcase. The campaign runner knows nothing about
+regexes, implementation names, corpora, or golden files; it launches artifact
+binaries with argument arrays supplied by the specification.
 
-A prebuilt binary from before the `optiwork-fixed-v1` protocol cannot participate
-in this design; first apply the benchmark-protocol commit to both comparison
-revisions. The runner rejects any record with the wrong version or mode.
+## The lifecycle
 
-## Freeze the experiment
+The enforced order is:
 
-1. Work in an isolated branch or worktree and keep unrelated changes intact.
-2. Commit benchmark changes separately, then build baseline and candidate from
-   revisions that both contain the same benchmark protocol.
-3. Choose corpora, count, timed sessions, work seeds, the order seed, confidence
-   rule, and the maximum number of candidates **before** measuring a candidate.
-4. Keep machine conditions stable. Do not run benchmark series concurrently.
-5. Capture deterministic output and run the correctness gates:
-
-   ```sh
-   cargo fmt --all -- --check
-   cargo test --all-targets
-   cargo clippy --all-targets -- -D warnings
-   ```
-
-## Fixed-work measurements
-
-Build the bench binary once per impl in separate target directories so both stay
-available. The runner shells out and parses one `optiwork-fixed-v1` record per
-process, so it cannot tell the two binaries apart:
-
-```sh
-CARGO_TARGET_DIR=/tmp/optiwork-a cargo build --release -p regexbench --example bench
-CARGO_TARGET_DIR=/tmp/optiwork-b cargo build --release -p regexbench --example bench
-cargo build --release -p optikit-paired
+```text
+validate and fingerprint
+        ↓
+gate original baseline
+        ↓
+A/A calibration on the original baseline
+        ↓
+candidate 1 gate → compare with current baseline → promote or retain
+        ↓
+candidate 2 gate → compare with current baseline → promote or retain
+        ↓
+exactly one final-best vs original-baseline confirmation (if anything promoted)
+        ↓
+complete
 ```
 
-A fixed run scans the entire corpus through one impl's `find_all` once per
-session, `sessions` times, after one untimed warmup. `--count` must equal the
-corpus byte count exactly (the bench checks). Each session's work is the same
-scan, but a seed-derived permutation reorders the `(pattern, input)` pairs so
-every session has fresh branch and memory behavior — the match set is invariant
-under pair reordering, so this changes timing only, never output.
+Candidate order is frozen. A promoted candidate becomes the baseline for the
+next candidate; a rejected or gate-failing candidate does not. Exploration never
+uses confirmation seeds, and confirmation never changes a promotion decision.
+
+## 1. Freeze artifacts and design
+
+Build the original baseline and every candidate before starting the campaign.
+Give each one its own path and keep those files unchanged for the run. In a real
+optimization project these are normally builds from separate revisions or
+worktrees. The regex showcase uses distinct snapshot paths for a single
+runtime-selectable demo executable.
+
+The spec must also freeze:
+
+- the ordered candidate ladder and a hypothesis for each candidate;
+- every workload's gate arguments, timed arguments, fixed count, and sessions;
+- all input artifacts that must be fingerprinted;
+- the exact child environment and gate/paired process limits;
+- the A/A seeds, order seed, target effect, and allowed block-count range;
+- exploration and confirmation seeds and distinct order seeds; and
+- the lower-confidence-bound threshold and maximum candidate count.
+
+Run directories are append-once. The driver refuses an existing directory, copies
+the exact spec bytes into the new directory, and records SHA-256 fingerprints of
+the runner, binaries, spec, and declared workload artifacts. Changing an input
+means starting a new campaign.
+
+## 2. Gate correctness before timing
+
+The campaign first gates the original baseline on every workload. Failure here
+means the experiment is malformed and aborts the campaign.
+
+Each candidate is then gated on every workload before any timing for that
+candidate. A candidate gate failure is a valid negative candidate outcome: it is
+recorded, no paired process is launched for that candidate, the current baseline
+is retained, and the campaign proceeds to the next preregistered candidate.
+
+Gate status is a small protocol of its own: exit `0` passes, exit `1` reports a
+valid equivalence mismatch, and every other exit status or signal is operational.
+This prevents a missing fixture, crashed gate, or invalid invocation from being
+reported as a scientifically rejected candidate.
+
+For the showcase the gate compares exact match spans with committed golden
+vectors:
 
 ```sh
-# one observation, standalone
-/path/to/bench --measure scan --impl thompson \
-  --corpus corpora/main.bin --seed 42 --sessions 30 --count 8377
+bench --impl <artifact> --check <golden> --corpus <corpus>
 ```
 
-The record carries version, mode, seed, count, sessions, requested/completed
-work, attempts, elapsed nanoseconds, throughput, and matched byte count.
+Other subjects can use any deterministic, fail-closed gate expressed by their
+artifact's command-line interface.
 
-## Reproducible PGO training
+## 3. Calibrate A/A before exploration
 
-Build an instrumented bench, train it across `impls × corpora`, and build the
-profile-optimized bench with one isolated command:
+The same original-baseline artifact runs under both labels using a paired
+ABBA/BAAB schedule. A/A estimates environmental noise; it is never evidence that
+an optimization works.
+
+For each workload, `optikit-paired` reports a recommended block count for the
+predeclared target speedup. The campaign applies the frozen rule
+
+```text
+chosen_blocks = clamp(recommended_blocks, min_blocks, max_blocks)
+```
+
+before observing any candidate. An invalid A/A design or failed observation
+aborts the campaign. It cannot silently become positive calibration evidence.
+
+## 4. Explore with cumulative promotion
+
+Each valid candidate is compared with the current promoted baseline on every
+workload. An ABBA/BAAB block contains two observations per label; analysis uses
+the paired block log-throughput ratios. The runner reports the geometric speedup
+and a Student-t 95% one-sided lower confidence bound.
+
+The generic frozen rule is:
+
+```text
+promote iff every workload's lower_95_one_sided_ratio
+           is greater than decision.min_lower_bound_ratio
+```
+
+All complete, valid preregistered blocks remain in the analysis, including
+unusually fast or slow ones. The campaign does not add blocks, retry a statistical
+loss, drop outliers, reorder candidates, or change thresholds after results are
+known.
+
+These per-candidate results are exploratory. Testing multiple candidates is a
+selection process, so none of their individual confidence bounds is presented as
+the campaign's final confirmatory claim.
+
+## 5. Confirm once on fresh data
+
+If at least one candidate was promoted, the final promoted artifact is compared
+with the original baseline exactly once, on every workload, using the frozen
+confirmation order seed and work seeds. The confirmation uses the already chosen
+block counts; it cannot tune, retry, or promote anything.
+
+If nothing was promoted, the campaign records that confirmation was not
+applicable. A valid confirmation that misses the threshold is still a completed
+campaign with a negative confirmatory result.
+
+## Outcome semantics
+
+The process exit status reports whether the campaign machinery remained valid,
+not whether an optimization won:
+
+| outcome | meaning | campaign action | exit |
+|---|---|---|---|
+| `promoted` | every workload cleared the frozen bound | update current baseline | 0 |
+| `not_promoted` | valid evidence missed at least one bound | retain baseline | 0 |
+| `gate_failed` | candidate was not equivalent | skip its timing, retain baseline | 0 |
+| negative confirmation | valid held-out result missed a bound | record honestly | 0 |
+| `operational_failure` | launch, timeout, malformed output, invalid design, or I/O failure | abort; do not classify candidate performance | nonzero |
+
+This distinction prevents infrastructure errors from masquerading as scientific
+rejections and prevents ordinary statistical losses from looking like broken
+automation.
+
+## Fixed-work subprocess contract
+
+Each observation scans exactly `count × sessions` requested units after untimed
+warmup. The subject emits one `optiwork-fixed-v1` record. The paired runner checks
+the protocol version, mode, requested work, completed work, count, and finite
+positive throughput. It launches binaries with direct argument vectors, so paths
+and values containing spaces are not reparsed by a shell.
+
+Every child process has a timeout and bounded captured output. A timeout,
+nonzero exit, output overflow, malformed record, or work mismatch invalidates the
+design and causes a failing runner exit. Invalid blocks are logged and never
+replaced.
+
+The campaign applies a separate frozen timeout and per-stream output cap to each
+gate and whole paired-runner invocation. It also clears the ambient environment
+and supplies only the map recorded in the campaign spec. This prevents an
+unrecorded shell variable or a noisy/hung wrapper from silently changing or
+stalling the campaign.
+
+See [bench-protocol.md](bench-protocol.md) for the wire record and
+[campaign-spec.md](campaign-spec.md) for the orchestrator contract.
+
+## Running the showcase
+
+From the repository root:
 
 ```sh
-scripts/build-pgo.sh <unique-run-name>
+bash scripts/run-campaign.sh target/runs/regex-demo-local
 ```
 
-The script trains each (impl, corpus) pair with explicit fixed-work sessions.
-`naive` is omitted from the pathological corpus — it is exponential there and
-would never finish a training run. Training counts, session counts, seeds,
-source revision/state, tool versions, and the training matrix are recorded in
-`target/pgo/<run-name>/manifest.txt`. Build-time profiles are discarded, and the
-merge fails unless every planned runtime profile was produced. Treat the
-optimized bench as another candidate and evaluate it with the same paired
-protocol; do not compare build durations.
-
-## Calibrate noise with A/A
-
-Run the same prebuilt binary under both labels before testing candidates. The
-runner generates its entire ABBA/BAAB schedule from `--order-seed` and prints the
-plan before the first process starts. Repeating `--seed` cycles a fixed,
-preregistered base-seed set across blocks.
+The script runs formatting, tests, and Clippy; builds the three immutable demo
+artifact snapshots; and invokes:
 
 ```sh
-target/release/optikit-paired \
-  --aa target/release/examples/bench \
-  --measure scan \
-  --subject-args "--impl thompson --corpus corpora/main.bin" \
-  --count 8377 --sessions 30 --blocks 16 --order-seed 731 \
-  --seed 42 --seed 314159 --seed 271828 \
-  --target-speedup 3 | tee /tmp/optiwork-aa.log
+target/release/optikit-campaign \
+  --spec campaigns/regex-demo.json \
+  --run-dir target/runs/regex-demo-local
 ```
 
-`CALIBRATION` reports the observed block log-ratio standard deviation and an
-approximate block count for 80% power at the requested speedup. Choose and
-record the A/B block count before seeing candidate results; normally use at least
-8–16 blocks. A/A is a noise estimate, not evidence of a performance change.
+An atomic showcase lock is held from build through campaign completion. A second
+showcase run therefore cannot overwrite the shared snapshot paths or introduce
+concurrent benchmark load; use a separate project/spec for intentional parallel
+experiments.
 
-## Compare candidates (A/B) on both corpora
-
-```sh
-target/release/optikit-paired \
-  --baseline target/release/examples/bench \
-  --candidate target/release/examples/bench \
-  --measure scan \
-  --baseline-args "--impl naive --corpus corpora/main.bin" \
-  --candidate-args "--impl prefilter --corpus corpora/main.bin" \
-  --count 8377 --sessions 30 --blocks 8 --order-seed 9127 \
-  --seed 42 | tee /tmp/optiwork-ab-main.log
-```
-
-Run the same frozen design for `pathological`. The two corpora carry real weight
-because the wins concentrate differently: `thompson`/`prefilter` win huge on
-pathological, but `naive`'s tight backtracking is competitive on benign `main`
-input. The keep rule below requires winning on **both**.
-
-Each block contains two A and two B observations. The runner computes one paired
-log-throughput ratio per block, then reports:
-
-- the geometric candidate/baseline speedup;
-- the standard deviation of block log ratios;
-- a Student-t 95% one-sided lower confidence bound.
-
-Every complete, valid preregistered block is retained, including unusually fast
-or slow blocks. A block is invalid only when a process cannot start, exits
-unsuccessfully, emits a malformed record, or reports different requested work.
-Invalid blocks are logged, never replaced, and cause a failing runner exit.
-
-The per-candidate 95% result is labeled `scope=exploratory_per_candidate`. It is
-a screening result, not a familywise-error-controlled claim across a campaign.
-Use its lower bound to choose candidates, then reserve the confirmatory claim for
-fresh held-out data.
-
-## Equivalence gate (correctness before timing)
-
-Every candidate must produce the **exact same span set** as the oracle (the Rust
-`regex` crate, run offline to build `*.golden`). The gate runs before any timing
-and is fail-closed:
-
-```sh
-bench --check corpora/main.golden --impl <cand> --corpus corpora/main.bin
-bench --check corpora/pathological.golden --impl <cand> --corpus corpora/pathological.bin
-```
-
-A mismatch exits nonzero and the driver rejects the candidate before timing. This
-mirrors fenrin's byte-`cmp` gate: a speed difference must be provably
-performance, not a semantics change.
-
-## Each candidate
-
-1. State one concrete hypothesis and the work it should remove.
-2. Make one reversible change.
-3. Run formatting, tests, Clippy, and the equivalence gate on both corpora.
-4. Run the frozen paired designs on **both** corpora.
-5. Keep or reject using only the frozen rule below. Do not add runs, remove
-   observations, or change the analysis after seeing the result.
-6. Log the hypothesis, commit, full `PLAN`/`RESULT` records, gate results, and
-   decision. An accepted candidate becomes the next baseline.
-
-**Frozen keep/reject rule:** promote iff all gates passed AND the 95% one-sided
-lower bound (`lower_95_one_sided_ratio`) is `> 1.0` on `main` **and** on
-`pathological`. A win on only one corpus is a rejection — it signals a
-specialization the other corpus penalizes.
-
-For an **intentional semantics change** (the reserved demo: switching from
-leftmost-first to POSIX leftmost-longest), the span-set gate is *expected* to
-diverge. Define the new oracle and a separate multi-case quality check before
-timing, and never use throughput to waive correctness.
-
-## Held-out confirmation
-
-After the last accepted candidate, use fresh work seeds and a new order seed for
-one optimized-versus-start comparison. The driver's `--held-out` flag labels the
-record `scope=held_out_confirmation`:
-
-```sh
-optikit-campaign ... --baseline-impl naive --candidate-impl prefilter \
-  --order-seed 77 --seed 911 --held-out
-```
-
-Do not tune from this result. The 95% one-sided lower bound on both corpora is
-the campaign's confirmatory performance result. Record every held-out observation
-and final bound in `LOG.md`.
+Corpus and golden-vector files are committed, declared inputs. The campaign
+script deliberately does not regenerate them. Regeneration changes the
+experiment and should be followed by review and a new spec/run.
 
 ## Known limitations
 
-- **Goodhart on un-corpus'd inputs:** a candidate faster on the pinned corpora
-  but subtly wrong elsewhere passes the gate. The corpora are deliberately
-  adversarial but not exhaustive. The highest-risk candidate is a cached DFA.
-- **Quiet-machine invariant:** the stats assume no concurrent load; numbers are
-  not portable across machines. `LOG.md` records the CPU model and online vCPUs.
-- **Single-dimension oracle:** regex has one span-set check, so it cannot catch
-  distributional drift the way a multi-statistic quality gate can. The
-  intentional-semantics-change path is correspondingly weaker — a known
-  limitation, not a bug.
+- Confidence intervals describe the frozen workloads, not uncaptured production
+  distributions. Improve workload coverage instead of weakening the gate.
+- The paired statistics assume stable machine conditions and no concurrent
+  benchmark series. Numbers are not portable across hosts.
+- SHA-256 proves which bytes participated; it does not prove how a binary was
+  built. Preserve build manifests or revision metadata alongside serious runs.
+- A single threshold across workloads is intentionally strict. Projects needing
+  weighted tradeoffs should define and version a new decision policy rather than
+  interpreting this one informally.

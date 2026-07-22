@@ -47,6 +47,49 @@ The runner validates `mode`, `requested`, `completed == requested`, and that
   replaced, and causes a failing runner exit.
 - `--count` must equal the corpus byte total. The bench checks this itself so a
   misconfigured runner cannot produce a silently wrong record.
+- `count * sessions` and `blocks * 4` must fit their integer domains. The runner
+  rejects oversized designs before allocating a schedule or starting a child.
+
+An invalid block is emitted with `evidence=invalid_design`; it is never labeled
+as positive, negative, or calibration evidence. The runner exits nonzero after
+recording the failure, and a campaign must classify it as an operational failure
+rather than a candidate rejection.
+
+Decision-bearing floating-point fields in `RESULT` (`log_ratio_sd`, ratios, and
+log ratios) are rendered with round-trip precision. A campaign therefore compares
+the computed confidence bound, not a display-rounded approximation of it.
+
+## Safe argument and process handling
+
+Preferred runner options are repeatable direct arguments:
+
+```sh
+optikit-paired \
+  --baseline /build/baseline-bench \
+  --candidate /build/candidate-bench \
+  --baseline-arg --variant --baseline-arg "baseline with spaces" \
+  --candidate-arg --variant --candidate-arg "candidate with spaces" \
+  --measure scan --count 10000 --sessions 20 --blocks 8 \
+  --order-seed 1 --seed 42
+```
+
+`--subject-arg` is the A/A equivalent. The legacy `--baseline-args`,
+`--candidate-args`, and `--subject-args` whitespace-split blobs remain available
+for compatibility, but direct and legacy transports are globally exclusive: any
+`--*-arg` option makes every `--*-args` option invalid in that invocation.
+Campaigns use only direct arguments so paths and values are preserved exactly.
+When all exact argument arrays are empty, `--direct-args` selects the direct
+transport explicitly and ensures the subject receives no synthetic legacy
+`--subject-args ""` option. Campaigns always pass this selector.
+
+Every observation is bounded by `--timeout-ms` (default 300000) and
+`--max-output-bytes` per stream (default 1048576, hard maximum 67108864). Stdout
+and stderr are drained while the child runs to avoid pipe deadlocks. On Unix, a
+subject runs in its own process group, and a timeout kills that whole group,
+reaps the direct child, and joins its pipe readers. Other platforms fall back to
+killing the direct child. Output overflow, invalid UTF-8/record shape, a launch
+error, or a nonzero exit invalidates the design. Captured diagnostics remain
+available in the campaign's raw evidence files.
 
 ## Non-timed paths
 
@@ -55,7 +98,8 @@ in the timed path:
 
 - `--check <golden>` — equivalence gate: loads golden spans and requires exact
   span-set equality for every pair. Prints `PASS impl=… pairs=… spans_checked`
-  or `FAIL …`. Exits nonzero on any mismatch.
+  or `FAIL …`. Exit `0` passes, exit `1` is a valid mismatch, and exit `2` is an
+  operational/configuration failure, matching the campaign gate contract.
 - `--count-of <corpus>` — prints the corpus byte count, so the runner/script can
   set `--count` exactly.
 - `--help` — usage.

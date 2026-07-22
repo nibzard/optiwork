@@ -8,10 +8,12 @@ measurement discipline that makes optimization decisions trustworthy:
 
 - a **fixed-work** contract (the work is pinned, not the time);
 - a **versioned subprocess protocol** so the runner cannot tell candidates apart;
-- **paired A/B + A/A** scheduling with a Student-t 95% one-sided lower bound;
+- **paired A/B + automatic A/A calibration** with a Student-t 95% one-sided
+  lower bound;
 - a **fail-closed equivalence gate** (correctness before timing);
-- a **frozen, pre-registered keep/reject rule**, written down before the result
-  is seen, and a **held-out confirmation** reserved for fresh data.
+- a **versioned campaign state machine** that promotes the real baseline; and
+- a **frozen, pre-registered keep/reject rule** plus exactly one held-out
+  confirmation of the final promoted artifact against the original baseline.
 
 The harness is generic. The demo subject is a small regex engine with three
 matchers — a naive backtracker, a Thompson-NFA Pike VM, and a literal-prefix
@@ -20,7 +22,7 @@ between them is therefore provably performance, never a semantics change.
 
 ## The headline result
 
-Running `scripts/run-campaign.sh` drives two candidates through the harness
+The original showcase run drove two candidates through the harness
 against a naive baseline, each on two corpora (`main`: benign, `pathological`:
 catastrophic-backtracking). The frozen rule promotes a candidate only if its 95%
 lower bound beats 1.0 on **both** corpora.
@@ -35,10 +37,14 @@ catastrophic input — an obviously "better" engine — but its per-byte thread-
 overhead is slower than tight backtracking on benign input, so it regresses on
 `main`. The two-corpus rule refuses to promote a specialization that one corpus
 penalizes. The prefilter then wins on both: SIMD-skipping to literal hits on the
-large haystack, and inheriting the linear Pike VM on pathological patterns. Both
-decisions were reproduced by held-out runs with fresh seeds.
+large haystack, and inheriting the linear Pike VM on pathological patterns. The
+current campaign preserves that candidate order but uses each accepted candidate
+as the next baseline and reserves fresh seeds for one final
+optimized-versus-original confirmation.
 
-Full numbers and the preregistered `PLAN`/`RESULT` records are in [`LOG.md`](LOG.md).
+The original run's numbers and `PLAN`/`RESULT` records are preserved in
+[`LOG.md`](LOG.md). New runs are self-contained under `target/runs/` and never
+append to this historical file.
 
 ## Workspace
 
@@ -46,20 +52,21 @@ Full numbers and the preregistered `PLAN`/`RESULT` records are in [`LOG.md`](LOG
 crates/
   optikit/          dependency-free lib: FixedRecord, schedule RNG, statistics
   optikit-paired/   generic A/B + A/A runner (subprocess + versioned record)
-  optikit-campaign/ scripted campaign driver (gate → paired → keep/reject → LOG)
+  optikit-campaign/ versioned campaign state machine and evidence recorder
   regexbench/       the demo subject (lib + bench/gen_golden examples)
+campaigns/          frozen, machine-readable experiment specifications
 corpora/, scripts/, docs/
 ```
 
-`optikit` has no dependencies and no I/O. The runners depend only on `optikit` +
-std. `regexbench` adds `memchr` (timed path) and `regex` (oracle-only, behind the
-`oracle` cargo feature, never linked into the timed binary).
+`optikit` has no dependencies and no I/O. `regexbench` adds `memchr` (timed path)
+and `regex` (oracle-only, behind the `oracle` cargo feature, never linked into the
+timed binary). The campaign layer uses JSON for its specification and evidence.
 
 ## Quick start
 
 ```sh
-# correctness gates + the full campaign (appends to LOG.md)
-bash scripts/run-campaign.sh
+# correctness checks + the full campaign in a new run directory
+bash scripts/run-campaign.sh target/runs/regex-demo-local
 
 # regenerate corpora + golden vectors (only when the corpus changes)
 cargo run -p regexbench --features oracle --example gen_golden -- corpora
@@ -72,6 +79,13 @@ cargo build --release -p regexbench --example bench
 # profile-guided build of the bench binary
 scripts/build-pgo.sh myrun
 ```
+
+The runner refuses to reuse a run directory. Its `spec.json`, `state.json`,
+`events.jsonl`, `provenance.json`, `raw/`, and `report.md` together form the
+campaign record. The checked-in showcase spec is
+[`campaigns/regex-demo.json`](campaigns/regex-demo.json). The showcase script
+also holds an atomic lock for its full run, preventing concurrent measurements
+or artifact overwrites.
 
 ## The matchers (`--impl`)
 
@@ -106,8 +120,10 @@ Oracle: `regex` 1.13.1, byte-oriented (`(?-u)`), leftmost-first.
 ## Documentation
 
 - [`docs/optimization-loop.md`](docs/optimization-loop.md) — the full measurement
-  protocol: fixed work, A/A calibration, A/B on both corpora, the frozen
-  keep/reject rule, held-out confirmation, known limitations.
+  lifecycle: immutable artifacts, A/A calibration, cumulative promotion,
+  outcome semantics, and one-shot confirmation.
+- [`docs/campaign-spec.md`](docs/campaign-spec.md) — the campaign JSON contract,
+  state transitions, and durable run artifacts.
 - [`docs/bench-protocol.md`](docs/bench-protocol.md) — the `optiwork-fixed-v1`
   record wire format and validation rules.
 

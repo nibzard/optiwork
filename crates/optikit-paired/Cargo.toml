@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 optikit = { path = "../optikit" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

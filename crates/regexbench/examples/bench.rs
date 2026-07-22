@@ -330,7 +330,9 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("regexbench-bench: {error}");
-            ExitCode::FAILURE
+            // Exit 1 is reserved for a valid equivalence mismatch. Configuration,
+            // input, and execution errors are operational failures for the campaign.
+            ExitCode::from(2)
         }
     }
 }
