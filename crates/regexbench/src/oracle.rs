@@ -7,8 +7,9 @@
 //!
 //! The bench binary and the candidate matchers never depend on this; it exists only
 //! to generate golden vectors offline. A second trusted engine cross-check lives in
-//! the generator (and a differential test in `tests/`), so a `regex`-crate bug in
-//! leftmost-first matching cannot silently bless a wrong candidate.
+//! the generator (and a naive-vs-thompson differential test in the `thompson`
+//! module), so a `regex`-crate bug in leftmost-first matching cannot silently bless
+//! a wrong candidate.
 
 use crate::corpus::{GoldenPair, Pair};
 use crate::Span;

@@ -29,7 +29,7 @@ The bench emits, in order, tab-separated:
 | `warmup_sessions` | untimed warmups, currently `1` |
 | `requested` | `count * sessions` |
 | `completed` | work actually done; must equal `requested` (no adaptive early-exit) |
-| `attempts` | number of `find_all` scans performed (`sessions + warmup`) |
+| `attempts` | timed `find_all` scans performed (`sessions × corpus pairs`; the warmup scan is excluded) |
 | `elapsed_ns` | nanoseconds spent in the timed sessions |
 | `items_per_second` | `completed * 1e9 / elapsed_ns` — bytes scanned/sec, the primary metric |
 | `output_bytes` | total bytes covered by reported matches (diagnostic) |

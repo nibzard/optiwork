@@ -27,10 +27,10 @@ lower bound beats 1.0 on **both** corpora.
 
 | candidate | main | pathological | decision |
 |---|---|---|---|
-| `thompson` (Pike VM) | **−41.6%** (regression) | **+128,413×** | rejected |
-| `prefilter` (memchr prefix) | **+127%** (lower95 = 2.25) | **+134,341×** | **promoted** |
+| `thompson` (Pike VM) | **−42.3%** (regression) | **+120,162×** | rejected |
+| `prefilter` (memchr prefix) | **+128%** (lower95 = 2.24) | **+135,384×** | **promoted** |
 
-The interesting part is the **rejection**. A Pike VM is ~128,000× faster on
+The interesting part is the **rejection**. A Pike VM is ~120,000× faster on
 catastrophic input — an obviously "better" engine — but its per-byte thread-list
 overhead is slower than tight backtracking on benign input, so it regresses on
 `main`. The two-corpus rule refuses to promote a specialization that one corpus
@@ -48,7 +48,7 @@ crates/
   optikit-paired/   generic A/B + A/A runner (subprocess + versioned record)
   optikit-campaign/ scripted campaign driver (gate → paired → keep/reject → LOG)
   regexbench/       the demo subject (lib + bench/gen_golden examples)
-configs/, corpora/, scripts/, docs/
+corpora/, scripts/, docs/
 ```
 
 `optikit` has no dependencies and no I/O. The runners depend only on `optikit` +

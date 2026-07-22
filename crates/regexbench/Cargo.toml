@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Regex-engine demo subject for optiwork: naive, Thompson NFA, Pike VM, cached DFA, SIMD-prefix impls"
+description = "Regex-engine demo subject for optiwork: naive backtracker, Thompson NFA Pike VM, and SIMD literal-prefix prefilter impls"
 
 [lib]
 path = "src/lib.rs"

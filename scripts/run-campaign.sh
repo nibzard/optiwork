@@ -6,8 +6,8 @@
 #
 # The ladder lives here (one optikit-campaign call per step). The keep/reject rule is
 # frozen in the driver: a candidate is promoted only if it beats its baseline on BOTH
-# corpora (lower 95% bound > 1). Baseline for step N is the previous step's candidate
-# if it was promoted, else the current best.
+# corpora (lower 95% bound > 1). Every step measures against the naive start; BEST
+# only records the last promoted candidate for the final summary.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,10 +16,6 @@ BENCH=./target/release/examples/bench
 PAIRED=./target/release/optikit-paired
 CAMPAIGN=./target/release/optikit-campaign
 LOG=LOG.md
-
-# Corpus byte counts (so --count matches exactly what the bench scans).
-MAIN_COUNT=$("$BENCH" --count-of corpora/main.bin 2>/dev/null || echo 8377)
-PATH_COUNT=$("$BENCH" --count-of corpora/pathological.bin 2>/dev/null || echo 150)
 
 # Shared preregistered parameters. main is benign (cheap per byte) so we afford many
 # sessions/blocks; pathological is catastrophic for naive, so sessions stay tiny.
@@ -40,7 +36,12 @@ cargo fmt --all -- --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 
-# current best impl, updated as candidates are promoted. Starts at naive.
+# Corpus byte counts (so --count matches exactly what the bench scans). Computed
+# after the build and corpus regeneration so they can never go stale.
+MAIN_COUNT=$("$BENCH" --count-of corpora/main.bin)
+PATH_COUNT=$("$BENCH" --count-of corpora/pathological.bin)
+
+# Last promoted candidate, echoed in the final summary. Starts at the naive baseline.
 BEST=naive
 
 run_step() {

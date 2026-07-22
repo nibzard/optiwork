@@ -5,8 +5,8 @@ metric is **bytes scanned per second** through one implementation's `find_all`
 over a fixed `(pattern, input)` corpus: pattern compilation and process startup
 are outside the timed region; the full corpus scan is inside it.
 
-`matches_per_second` is emitted as a diagnostic sidecar. It is not a substitute
-for the bytes-scanned result.
+`output_bytes` (total bytes covered by reported matches) is emitted as a
+diagnostic sidecar. It is not a substitute for the bytes-scanned result.
 
 A prebuilt binary from before the `optiwork-fixed-v1` protocol cannot participate
 in this design; first apply the benchmark-protocol commit to both comparison
