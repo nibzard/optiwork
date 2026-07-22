@@ -53,6 +53,17 @@ fi
 
 mkdir -p "$profiles_root"
 
+# Pin the corpus byte counts up front with a NON-instrumented bench. Doing this
+# with the instrumented binary would emit a stray profraw into $profiles_root and
+# break the exact-count invariant below.
+release_bench="$repo_root/target/release/examples/bench"
+(
+    cd "$repo_root"
+    cargo build --release -p regexbench --example bench >/dev/null
+)
+main_count=$("$release_bench" --count-of "$repo_root/corpora/main.bin")
+path_count=$("$release_bench" --count-of "$repo_root/corpora/pathological.bin")
+
 source_revision=$(git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null || true)
 source_revision=${source_revision:-unknown}
 if [[ "$source_revision" == unknown ]]; then
@@ -108,7 +119,11 @@ echo "Training across impls × corpora"
 for ((i = 0; i < ${#training_matrix[@]}; i += 2)); do
     impl="${training_matrix[$i]}"
     stem="${training_matrix[$((i + 1))]}"
-    count=$("$bench" --count-of "$repo_root/corpora/$stem.bin")
+    case "$stem" in
+        main) count=$main_count ;;
+        pathological) count=$path_count ;;
+        *) echo "unknown corpus stem: $stem" >&2; exit 2 ;;
+    esac
     echo "  train: impl=$impl corpus=$stem count=$count"
     LLVM_PROFILE_FILE="$profiles_root/$impl-$stem-%m.profraw" \
         "$bench" --measure scan --impl "$impl" \
