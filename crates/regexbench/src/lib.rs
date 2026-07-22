@@ -25,6 +25,8 @@ pub mod naive;
 #[cfg(feature = "oracle")]
 pub mod oracle;
 pub mod prefilter;
+#[cfg(feature = "oracle")]
+pub mod sota;
 pub mod thompson;
 
 /// A half-open byte span `[start, end)` into the input.

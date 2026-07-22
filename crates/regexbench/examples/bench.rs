@@ -3,7 +3,11 @@
 // ABOUTME: a corpus through a chosen impl with fixed work (count*sessions bytes), and
 // ABOUTME: doubles as an equivalence gate (`--check <golden>`) and a corpus-size
 // ABOUTME: helper (`--count-of <path>`). Depends only on std + regexbench, never on
-// ABOUTME: the harness or the oracle crate.
+// ABOUTME: the harness crate. The candidate impls (naive/thompson/prefilter) are
+// ABOUTME: timed from a NO-ORACLE build, so the regex crate never enters the
+// ABOUTME: candidate binary. `--impl regex_crate` is the same-machine SOTA baseline
+// ABOUTME: and is compiled in only under the `oracle` feature (the regex crate IS the
+// ABOUTME: oracle); it is an external ceiling, never an optimization candidate.
 
 use std::env;
 use std::fs;
@@ -24,6 +28,9 @@ regexbench bench binary (optiwork subject)
 
 Timed fixed-work run (driven by optikit-paired):
   bench --measure <mode> --seed <n> --sessions <n> --count <n> --subject-args \"--impl <name> --corpus <path>\"
+
+Same-machine SOTA baseline (requires a build with --features oracle):
+  bench --measure scan --impl regex_crate --corpus <path> --seed <n> --sessions <n> --count <n>
 
 Equivalence gate:
   bench --check <golden> --impl <name> --corpus <path> \
@@ -186,22 +193,86 @@ fn scan_once(
     (attempts, output_bytes)
 }
 
-fn run_timed(config: &Config) -> Result<(), String> {
-    let impl_name = config
-        .impl_name
-        .as_deref()
-        .ok_or_else(|| "timed run requires `--impl`".to_owned())?;
-    let impl_ = Impl::parse(impl_name)?;
+/// Same scan shape as `scan_once`, but driving the `regex`-crate baseline. Gated on
+/// `oracle`: the no-oracle candidate build does not compile this, so the regex crate
+/// cannot enter the candidate timed binary.
+#[cfg(feature = "oracle")]
+fn scan_once_regex_crate(
+    compiled: &[regexbench::sota::CompiledPattern],
+    pairs: &[Pair],
+    rng: &mut Rng,
+    out: &mut Vec<Span>,
+) -> (u64, u64) {
+    let order = rng.permute(pairs.len());
+    let mut attempts = 0u64;
+    let mut output_bytes = 0u64;
+    for &idx in &order {
+        out.clear();
+        output_bytes += regexbench::sota::scan_pair(compiled, pairs, idx, out);
+        attempts += 1;
+    }
+    (attempts, output_bytes)
+}
+
+/// Shared timed loop for any scan closure: one untimed warmup, then `sessions`
+/// timed passes. Emits the single `optiwork-fixed-v1` record. Both the candidate
+/// path and the `regex_crate` baseline route through here so their records are
+/// directly comparable (same work, same accounting, same line format).
+fn run_timed_loop(
+    mode: &str,
+    seed: u64,
+    count: u64,
+    sessions: u64,
+    requested: u64,
+    mut scan: impl FnMut(&mut Rng, &mut Vec<Span>) -> (u64, u64),
+) -> Result<(), String> {
+    let mut rng = Rng::new(seed);
+    let mut out = Vec::new();
+    // Warmup: one untimed scan.
+    scan(&mut rng, &mut out);
+
+    let start = Instant::now();
+    let mut attempts = 0u64;
+    let mut output_bytes = 0u64;
+    for _ in 0..sessions {
+        let (a, b) = scan(&mut rng, &mut out);
+        attempts += a;
+        output_bytes += b;
+    }
+    let elapsed_ns = start.elapsed().as_nanos();
+    if elapsed_ns == 0 {
+        return Err("timed region took zero nanoseconds".to_owned());
+    }
+    let items_per_second = requested as f64 * 1_000_000_000.0 / elapsed_ns as f64;
+
+    println!(
+        "{FIXED_RECORD_VERSION}\tmode={mode}\tseed={seed}\tcount={count}\tsessions={sessions}\twarmup_sessions=1\trequested={requested}\tcompleted={requested}\tattempts={attempts}\telapsed_ns={elapsed_ns}\titems_per_second={items_per_second}\toutput_bytes={output_bytes}",
+    );
+    Ok(())
+}
+
+/// Resolved, validated inputs for a timed run. `count` is asserted equal to the
+/// corpus byte count (the fixed-work contract); `requested` is `count * sessions`.
+struct TimedPlan {
+    pairs: Vec<Pair>,
+    seed: u64,
+    count: u64,
+    sessions: u64,
+    requested: u64,
+    mode: String,
+}
+
+/// Resolve corpus + count + sessions + requested for a timed run, validating the
+/// fixed-work contract (`count` == corpus bytes) shared by every impl.
+fn timed_setup(config: &Config, role: &str) -> Result<TimedPlan, String> {
     let corpus_path = config
         .corpus
         .as_deref()
-        .ok_or_else(|| "timed run requires `--corpus`".to_owned())?;
+        .ok_or_else(|| format!("{role} requires `--corpus`"))?;
     let pairs = load_corpus(corpus_path)?;
     if pairs.is_empty() {
         return Err("corpus contains no pairs".to_owned());
     }
-    let compiled = compile_all(&pairs)?;
-
     let sessions = config
         .sessions
         .ok_or_else(|| "missing `--sessions`".to_owned())?;
@@ -218,30 +289,69 @@ fn run_timed(config: &Config) -> Result<(), String> {
     let requested = count
         .checked_mul(sessions)
         .ok_or_else(|| "count times sessions overflowed".to_owned())?;
+    Ok(TimedPlan {
+        pairs,
+        seed,
+        count,
+        sessions,
+        requested,
+        mode,
+    })
+}
 
-    let mut rng = Rng::new(seed);
-    let mut out = Vec::new();
-    // Warmup: one untimed scan.
-    scan_once(impl_, &compiled, &pairs, &mut rng, &mut out);
+fn run_timed(config: &Config) -> Result<(), String> {
+    let impl_name = config
+        .impl_name
+        .as_deref()
+        .ok_or_else(|| "timed run requires `--impl`".to_owned())?;
 
-    let start = Instant::now();
-    let mut attempts = 0u64;
-    let mut output_bytes = 0u64;
-    for _ in 0..sessions {
-        let (a, b) = scan_once(impl_, &compiled, &pairs, &mut rng, &mut out);
-        attempts += a;
-        output_bytes += b;
+    // The regex_crate baseline needs the regex crate, i.e. the `oracle` feature.
+    #[cfg(feature = "oracle")]
+    if impl_name == "regex_crate" {
+        return run_timed_regex_crate(config);
     }
-    let elapsed_ns = start.elapsed().as_nanos();
-    if elapsed_ns == 0 {
-        return Err("timed region took zero nanoseconds".to_owned());
+    #[cfg(not(feature = "oracle"))]
+    if impl_name == "regex_crate" {
+        return Err(
+            "the `regex_crate` baseline requires the `oracle` cargo feature (the regex \
+             crate is the oracle); rebuild the bench with --features oracle"
+                .to_owned(),
+        );
     }
-    let items_per_second = requested as f64 * 1_000_000_000.0 / elapsed_ns as f64;
 
-    println!(
-        "{FIXED_RECORD_VERSION}\tmode={mode}\tseed={seed}\tcount={count}\tsessions={sessions}\twarmup_sessions=1\trequested={requested}\tcompleted={requested}\tattempts={attempts}\telapsed_ns={elapsed_ns}\titems_per_second={items_per_second}\toutput_bytes={output_bytes}",
-    );
-    Ok(())
+    let impl_ = Impl::parse(impl_name)?;
+    let plan = timed_setup(config, "timed run")?;
+    let compiled = compile_all(&plan.pairs)?;
+    let scan =
+        |rng: &mut Rng, out: &mut Vec<Span>| scan_once(impl_, &compiled, &plan.pairs, rng, out);
+    run_timed_loop(
+        &plan.mode,
+        plan.seed,
+        plan.count,
+        plan.sessions,
+        plan.requested,
+        scan,
+    )
+}
+
+/// Timed run of the `regex`-crate baseline. Patterns are precompiled before timing;
+/// the warmup pass inside `run_timed_loop` warms the lazy DFA, so the timed region
+/// measures matching.
+#[cfg(feature = "oracle")]
+fn run_timed_regex_crate(config: &Config) -> Result<(), String> {
+    let plan = timed_setup(config, "timed run")?;
+    let compiled = regexbench::sota::compile_all(&plan.pairs)?;
+    let scan = |rng: &mut Rng, out: &mut Vec<Span>| {
+        scan_once_regex_crate(&compiled, &plan.pairs, rng, out)
+    };
+    run_timed_loop(
+        &plan.mode,
+        plan.seed,
+        plan.count,
+        plan.sessions,
+        plan.requested,
+        scan,
+    )
 }
 
 fn run_check(config: &Config) -> Result<bool, String> {
@@ -249,6 +359,20 @@ fn run_check(config: &Config) -> Result<bool, String> {
         .impl_name
         .as_deref()
         .ok_or_else(|| "gate run requires `--impl`".to_owned())?;
+
+    #[cfg(feature = "oracle")]
+    if impl_name == "regex_crate" {
+        return run_check_regex_crate(config, impl_name);
+    }
+    #[cfg(not(feature = "oracle"))]
+    if impl_name == "regex_crate" {
+        return Err(
+            "the `regex_crate` baseline requires the `oracle` cargo feature (the regex \
+             crate is the oracle); rebuild the bench with --features oracle"
+                .to_owned(),
+        );
+    }
+
     let impl_ = Impl::parse(impl_name)?;
     let corpus_path = config
         .corpus
@@ -288,6 +412,78 @@ fn run_check(config: &Config) -> Result<bool, String> {
         let re = Regex::new(&pair.pattern)?;
         out.clear();
         impl_.find_all(&re, &pair.input, &mut out);
+        if out != golden[idx].spans {
+            mismatches += 1;
+            if mismatches <= 5 {
+                eprintln!(
+                    "MISMATCH impl={impl_name} pair={idx} pattern={:?} input_len={} expected={} got={}",
+                    pair.pattern,
+                    pair.input.len(),
+                    golden[idx].spans.len(),
+                    out.len()
+                );
+            }
+        }
+    }
+    if mismatches == 0 {
+        println!(
+            "{GATE_RECORD_VERSION}\tstatus=equivalent\tartifact_id={gate_artifact_id}\tworkload_id={gate_workload_id}\tchecked_units={}",
+            corpus.len()
+        );
+        Ok(true)
+    } else {
+        eprintln!(
+            "FAIL impl={impl_name} mismatched_pairs={mismatches}/{}",
+            corpus.len()
+        );
+        Ok(false)
+    }
+}
+
+/// Equivalence gate for the `regex_crate` baseline. The regex crate compiled with
+/// `(?-u)` *is* the oracle, so its spans equal the golden vectors by construction;
+/// this still validates that the corpus and golden line up pair-for-pair and emits
+/// the gate record, keeping `regex_crate` a first-class `--impl`.
+#[cfg(feature = "oracle")]
+fn run_check_regex_crate(config: &Config, impl_name: &str) -> Result<bool, String> {
+    let corpus_path = config
+        .corpus
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--corpus`".to_owned())?;
+    let golden_path = config
+        .check
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--check`".to_owned())?;
+    let gate_artifact_id = config
+        .gate_artifact_id
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--optiwork-gate-artifact-id`".to_owned())?;
+    let gate_workload_id = config
+        .gate_workload_id
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--optiwork-gate-workload-id`".to_owned())?;
+
+    let corpus = load_corpus(corpus_path)?;
+    if corpus.is_empty() {
+        return Err("gate corpus contains no pairs".to_owned());
+    }
+    let golden_bytes =
+        fs::read(golden_path).map_err(|e| format!("could not read golden `{golden_path}`: {e}"))?;
+    let golden = deserialize_golden(&golden_bytes)?;
+    if golden.len() != corpus.len() {
+        return Err(format!(
+            "corpus has {} pairs but golden has {}; they do not match",
+            corpus.len(),
+            golden.len()
+        ));
+    }
+    let compiled = regexbench::sota::compile_all(&corpus)?;
+
+    let mut mismatches = 0usize;
+    let mut out = Vec::new();
+    for (idx, pair) in corpus.iter().enumerate() {
+        out.clear();
+        regexbench::sota::find_all(&compiled[idx], &pair.input, &mut out);
         if out != golden[idx].spans {
             mismatches += 1;
             if mismatches <= 5 {

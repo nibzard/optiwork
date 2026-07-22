@@ -78,6 +78,10 @@ cargo build --release -p regexbench --example bench
 
 # profile-guided build of the bench binary
 scripts/build-pgo.sh myrun
+
+# same-machine SOTA baseline: time the real `regex` crate on this corpus/CPU
+# (the number to beat). Built under the `oracle` feature; never a candidate.
+bash scripts/run-sota-baseline.sh
 ```
 
 The runner refuses to reuse a run directory. Its `spec.json`, `state.json`,
@@ -126,6 +130,9 @@ Oracle: `regex` 1.13.1, byte-oriented (`(?-u)`), leftmost-first.
   state transitions, and durable run artifacts.
 - [`docs/bench-protocol.md`](docs/bench-protocol.md) — the `optiwork-fixed-v1`
   record wire format and validation rules.
+- [`docs/sota-2026.md`](docs/sota-2026.md) — regex-engine SOTA leaderboard, the
+  techniques that drive it, and the measured same-machine `regex_crate` baseline
+  (the ceiling our candidates chase).
 
 ## Origin
 
