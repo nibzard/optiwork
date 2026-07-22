@@ -19,8 +19,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use optikit::{approximate_power_blocks, randomized_schedule};
+
 const SPEC_VERSION: &str = "optiwork-campaign-v1";
 const STATE_VERSION: &str = "optiwork-campaign-state-v1";
+const GATE_RECORD_VERSION: &str = "optiwork-gate-v1";
+const PAIRED_PROTOCOL_VERSION: &str = "optiwork-paired-v1";
 const MAX_PAIRED_BLOCKS: usize = 100_000;
 const MAX_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -110,6 +114,7 @@ struct CalibrationSpec {
     order_seed: u64,
     seeds: Vec<u64>,
     target_speedup_percent: f64,
+    max_abs_mean_log_ratio: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -141,7 +146,8 @@ struct ResultSummary {
     blocks: usize,
     lower_95_one_sided_ratio: f64,
     speedup_percent: f64,
-    evidence: String,
+    paired_evidence: String,
+    threshold_met: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,6 +156,8 @@ struct CalibrationOutcome {
     planned_blocks: usize,
     recommended_blocks: usize,
     selected_blocks: usize,
+    block_cap_applied: bool,
+    mean_log_ratio: f64,
     log_ratio_sd: f64,
 }
 
@@ -175,7 +183,8 @@ struct BaselineTransition {
 #[derive(Clone, Debug, Serialize)]
 struct ConfirmationOutcome {
     original_baseline: String,
-    final_baseline: String,
+    exploration_winner: String,
+    accepted_baseline: String,
     decision: String,
     workloads: Vec<ResultSummary>,
 }
@@ -189,6 +198,7 @@ struct CampaignState {
     last_event_sequence: u64,
     original_baseline: String,
     current_baseline: String,
+    accepted_baseline: String,
     min_lower_bound_ratio: f64,
     calibrated_blocks: BTreeMap<String, usize>,
     calibrations: Vec<CalibrationOutcome>,
@@ -310,6 +320,14 @@ fn take_stream_snapshot(stream: &Arc<Mutex<StreamCapture>>) -> StreamSnapshot {
     let mut stream = stream_lock(stream);
     StreamSnapshot {
         bytes: std::mem::take(&mut stream.bytes),
+        exceeded: stream.exceeded,
+    }
+}
+
+fn copy_stream_snapshot(stream: &Arc<Mutex<StreamCapture>>) -> StreamSnapshot {
+    let stream = stream_lock(stream);
+    StreamSnapshot {
+        bytes: stream.bytes.clone(),
         exceeded: stream.exceeded,
     }
 }
@@ -566,7 +584,12 @@ fn capture_process(
                 drop(stdout_reader);
                 Vec::new()
             };
-            let stdout = take_stream_snapshot(&stdout_capture).bytes;
+            let stdout = if safe_to_join {
+                take_stream_snapshot(&stdout_capture)
+            } else {
+                copy_stream_snapshot(&stdout_capture)
+            }
+            .bytes;
             let mut detail = format!(
                 "could not start stderr reader for {}: {error}",
                 program.display()
@@ -582,6 +605,7 @@ fn capture_process(
     };
 
     let mut child_status = None;
+    let mut output_overflowed = false;
     let end = loop {
         if child_status.is_none() {
             match child.try_wait() {
@@ -597,9 +621,7 @@ fn capture_process(
         if let Some(error) = stderr.read_error {
             break CaptureEnd::ReadError(format!("stderr: {error}"));
         }
-        if stdout.exceeded || stderr.exceeded {
-            break CaptureEnd::OutputOverflow;
-        }
+        output_overflowed |= stdout.exceeded || stderr.exceeded;
         if stdout.finished && stderr.finished {
             if let Some(status) = child_status.take() {
                 break CaptureEnd::Completed(status);
@@ -607,7 +629,11 @@ fn capture_process(
         }
         let now = Instant::now();
         if now >= deadline {
-            break CaptureEnd::Timeout;
+            break if output_overflowed {
+                CaptureEnd::OutputOverflow
+            } else {
+                CaptureEnd::Timeout
+            };
         }
         thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
     };
@@ -621,6 +647,23 @@ fn capture_process(
             return operational_process_capture(
                 "read_error",
                 reader_errors.join("; "),
+                stdout.bytes,
+                stderr.bytes,
+            );
+        }
+        if stdout.exceeded || stderr.exceeded {
+            let streams = match (stdout.exceeded, stderr.exceeded) {
+                (true, true) => "stdout and stderr",
+                (true, false) => "stdout",
+                (false, true) => "stderr",
+                (false, false) => unreachable!("overflow requires an exceeded stream"),
+            };
+            return operational_process_capture(
+                "output_overflow",
+                format!(
+                    "{} {streams} exceeded the per-stream limit of {max_output_bytes} bytes",
+                    program.display()
+                ),
                 stdout.bytes,
                 stderr.bytes,
             );
@@ -646,8 +689,16 @@ fn capture_process(
         drop(stderr_reader);
         Vec::new()
     };
-    let stdout = take_stream_snapshot(&stdout_capture);
-    let stderr = take_stream_snapshot(&stderr_capture);
+    let stdout = if safe_to_join {
+        take_stream_snapshot(&stdout_capture)
+    } else {
+        copy_stream_snapshot(&stdout_capture)
+    };
+    let stderr = if safe_to_join {
+        take_stream_snapshot(&stderr_capture)
+    } else {
+        copy_stream_snapshot(&stderr_capture)
+    };
     let (status, mut detail) = match end {
         CaptureEnd::Completed(_) => unreachable!("completed capture returned above"),
         CaptureEnd::Timeout => (
@@ -755,6 +806,7 @@ impl RunContext {
             last_event_sequence: 0,
             original_baseline: spec.baseline.id.clone(),
             current_baseline: spec.baseline.id.clone(),
+            accepted_baseline: spec.baseline.id.clone(),
             min_lower_bound_ratio: spec.decision.min_lower_bound_ratio,
             calibrated_blocks: BTreeMap::new(),
             calibrations: Vec::new(),
@@ -871,8 +923,8 @@ impl RunContext {
         write_new_sync(&self.raw_dir.join(format!("{stem}.stdout")), &stdout)?;
         write_new_sync(&self.raw_dir.join(format!("{stem}.stderr")), &stderr)?;
         sync_directory(&self.raw_dir)?;
-        let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr_text = String::from_utf8_lossy(&stderr).into_owned();
+        let stdout_preview = compact_output(&stdout);
+        let stderr_preview = compact_output(&stderr);
         self.emit(
             phase,
             "command_completed",
@@ -887,11 +939,13 @@ impl RunContext {
                 "stderr_path": stderr_name,
                 "stdout_sha256": sha256_bytes(&stdout),
                 "stderr_sha256": sha256_bytes(&stderr),
+                "stdout_bytes": stdout.len(),
+                "stderr_bytes": stderr.len(),
                 "stdout_utf8": std::str::from_utf8(&stdout).is_ok(),
                 "stderr_utf8": std::str::from_utf8(&stderr).is_ok(),
                 "operational_error": operational_error.as_deref(),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
+                "stdout_preview": stdout_preview,
+                "stderr_preview": stderr_preview,
             }),
         )?;
         Ok(CapturedOutput {
@@ -972,7 +1026,8 @@ impl RunContext {
             json!({
                 "outcome": outcome,
                 "original_baseline": self.state.original_baseline,
-                "final_baseline": self.state.current_baseline,
+                "exploration_baseline": self.state.current_baseline,
+                "accepted_baseline": self.state.accepted_baseline,
                 "promotions": self.state.promotions.len(),
             }),
         )?;
@@ -1111,6 +1166,11 @@ fn validate(spec: &mut CampaignSpec, run_dir: &Path) -> Result<(), String> {
         || spec.calibration.target_speedup_percent <= 0.0
     {
         return Err("target_speedup_percent must be finite and positive".to_owned());
+    }
+    if !spec.calibration.max_abs_mean_log_ratio.is_finite()
+        || spec.calibration.max_abs_mean_log_ratio <= 0.0
+    {
+        return Err("max_abs_mean_log_ratio must be finite and positive".to_owned());
     }
     if !spec.decision.min_lower_bound_ratio.is_finite() || spec.decision.min_lower_bound_ratio < 1.0
     {
@@ -1354,6 +1414,20 @@ fn collect_provenance(
         path: spec_path.display().to_string(),
         sha256: spec_sha256.to_owned(),
     }];
+    let campaign_driver = env::current_exe()
+        .map_err(|error| format!("could not identify the running campaign driver: {error}"))?;
+    let campaign_driver = fs::canonicalize(&campaign_driver).map_err(|error| {
+        format!(
+            "could not resolve running campaign driver {}: {error}",
+            campaign_driver.display()
+        )
+    })?;
+    entries.push(provenance_file(
+        "campaign_driver",
+        "optikit-campaign",
+        None,
+        &campaign_driver,
+    )?);
     entries.push(provenance_file(
         "paired",
         "optikit-paired",
@@ -1443,6 +1517,7 @@ fn execute(spec: &CampaignSpec, context: &mut RunContext) -> Result<(), String> 
             "order_seed": spec.calibration.order_seed,
             "seeds": spec.calibration.seeds,
             "target_speedup_percent": spec.calibration.target_speedup_percent,
+            "max_abs_mean_log_ratio": spec.calibration.max_abs_mean_log_ratio,
         }),
     )?;
     for workload in &spec.workloads {
@@ -1453,6 +1528,8 @@ fn execute(spec: &CampaignSpec, context: &mut RunContext) -> Result<(), String> 
             planned_blocks: workload.calibration_blocks,
             recommended_blocks,
             selected_blocks,
+            block_cap_applied: recommended_blocks > workload.max_blocks,
+            mean_log_ratio: summary.mean_log_ratio,
             log_ratio_sd: summary.log_ratio_sd,
         };
         context
@@ -1529,9 +1606,7 @@ fn execute(spec: &CampaignSpec, context: &mut RunContext) -> Result<(), String> 
             false,
             "exploration",
         )?;
-        let promoted = results
-            .iter()
-            .all(|result| result.lower_95_one_sided_ratio > spec.decision.min_lower_bound_ratio);
+        let promoted = results.iter().all(|result| result.threshold_met);
         if promoted {
             current_baseline = candidate_artifact;
             context.state.current_baseline = current_baseline.id.clone();
@@ -1582,7 +1657,7 @@ fn execute(spec: &CampaignSpec, context: &mut RunContext) -> Result<(), String> 
         "confirmation",
         json!({
             "original_baseline": original_baseline.id,
-            "final_baseline": current_baseline.id,
+            "exploration_winner": current_baseline.id,
             "order_seed": spec.confirmation.order_seed,
             "seeds": spec.confirmation.seeds,
             "one_shot": true,
@@ -1597,12 +1672,14 @@ fn execute(spec: &CampaignSpec, context: &mut RunContext) -> Result<(), String> 
         true,
         "confirmation",
     )?;
-    let confirmed = results
-        .iter()
-        .all(|result| result.lower_95_one_sided_ratio > spec.decision.min_lower_bound_ratio);
+    let confirmed = results.iter().all(|result| result.threshold_met);
+    if confirmed {
+        context.state.accepted_baseline = current_baseline.id.clone();
+    }
     let confirmation = ConfirmationOutcome {
         original_baseline: original_baseline.id.clone(),
-        final_baseline: current_baseline.id.clone(),
+        exploration_winner: current_baseline.id.clone(),
+        accepted_baseline: context.state.accepted_baseline.clone(),
         decision: if confirmed {
             "confirmed"
         } else {
@@ -1633,6 +1710,62 @@ struct GateOutcome {
     failures: Vec<String>,
 }
 
+fn parse_gate_record(
+    stdout: &str,
+    expected_artifact_id: &str,
+    expected_workload_id: &str,
+) -> Result<u64, String> {
+    let mut lines = stdout.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| "gate emitted no success record".to_owned())?;
+    if lines.next().is_some() {
+        return Err("gate emitted more than one stdout line".to_owned());
+    }
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.first().copied() != Some(GATE_RECORD_VERSION) {
+        return Err(format!(
+            "unsupported gate record version `{}`; expected `{GATE_RECORD_VERSION}`",
+            fields.first().copied().unwrap_or("")
+        ));
+    }
+    let record_field = |key: &str| -> Result<&str, String> {
+        let prefix = format!("{key}=");
+        let mut values = fields
+            .iter()
+            .filter_map(|field| field.strip_prefix(&prefix));
+        let value = values
+            .next()
+            .ok_or_else(|| format!("gate record is missing `{key}`"))?;
+        if values.next().is_some() {
+            return Err(format!("gate record repeats `{key}`"));
+        }
+        Ok(value)
+    };
+    if record_field("status")? != "equivalent" {
+        return Err("gate success record status is not `equivalent`".to_owned());
+    }
+    let artifact_id = record_field("artifact_id")?;
+    if artifact_id != expected_artifact_id {
+        return Err(format!(
+            "gate record artifact `{artifact_id}` does not match `{expected_artifact_id}`"
+        ));
+    }
+    let workload_id = record_field("workload_id")?;
+    if workload_id != expected_workload_id {
+        return Err(format!(
+            "gate record workload `{workload_id}` does not match `{expected_workload_id}`"
+        ));
+    }
+    let checked_units = record_field("checked_units")?
+        .parse::<u64>()
+        .map_err(|_| "gate record `checked_units` is not an integer".to_owned())?;
+    if checked_units == 0 {
+        return Err("gate record `checked_units` must be positive".to_owned());
+    }
+    Ok(checked_units)
+}
+
 fn gate_artifact(
     spec: &CampaignSpec,
     context: &mut RunContext,
@@ -1641,12 +1774,19 @@ fn gate_artifact(
 ) -> Result<GateOutcome, String> {
     let mut failures = Vec::new();
     for workload in &spec.workloads {
-        let args = artifact
+        let mut args = artifact
             .args
             .iter()
+            .chain(&workload.args)
             .chain(&workload.gate_args)
             .cloned()
             .collect::<Vec<_>>();
+        args.extend([
+            "--optiwork-gate-artifact-id".to_owned(),
+            artifact.id.clone(),
+            "--optiwork-gate-workload-id".to_owned(),
+            workload.id.clone(),
+        ]);
         let label = format!("{role}-{}-{}", artifact.id, workload.id);
         let phase = context.state.phase.clone();
         context.verify_workload_artifacts(&phase, workload)?;
@@ -1658,6 +1798,24 @@ fn gate_artifact(
             &args,
             spec.limits.gate_timeout_ms,
         )?;
+        let checked_units = if output.success {
+            let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+                format!(
+                    "gate for {} on {} emitted non-UTF-8 stdout",
+                    artifact.id, workload.id
+                )
+            })?;
+            Some(
+                parse_gate_record(stdout, &artifact.id, &workload.id).map_err(|error| {
+                    format!(
+                        "gate for {} on {} returned invalid success evidence: {error}",
+                        artifact.id, workload.id
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         context.emit(
             &phase,
             "gate_result",
@@ -1667,6 +1825,7 @@ fn gate_artifact(
                 "workload_id": workload.id,
                 "passed": output.success,
                 "status": output.status,
+                "checked_units": checked_units,
                 "stdout_path": output.stdout_path,
                 "stderr_path": output.stderr_path,
             }),
@@ -1701,6 +1860,7 @@ struct ParsedPairedResult {
     lower_95_one_sided_ratio: f64,
     speedup_percent: f64,
     evidence: String,
+    mean_log_ratio: f64,
     log_ratio_sd: f64,
 }
 
@@ -1746,6 +1906,18 @@ fn run_calibration(
     )?;
     ensure_paired_success(&output, &format!("A/A calibration `{}`", workload.id))?;
     let stdout = paired_stdout(&output, &format!("A/A calibration `{}`", workload.id))?;
+    validate_paired_plan(
+        stdout,
+        "AA",
+        "calibration",
+        &spec.measure,
+        workload,
+        workload.calibration_blocks,
+        spec.calibration.order_seed,
+        &spec.calibration.seeds,
+        spec.limits.subject_timeout_ms,
+        spec.limits.max_output_bytes,
+    )?;
     let result = parse_paired_result(
         stdout,
         "AA",
@@ -1753,7 +1925,19 @@ fn run_calibration(
         &spec.measure,
         workload.calibration_blocks,
     )?;
-    let recommended = parse_calibration(stdout)?;
+    if result.mean_log_ratio.abs() > spec.calibration.max_abs_mean_log_ratio {
+        return Err(format!(
+            "A/A calibration `{}` mean log-ratio magnitude {} exceeds the frozen limit {}",
+            workload.id,
+            result.mean_log_ratio.abs(),
+            spec.calibration.max_abs_mean_log_ratio
+        ));
+    }
+    let recommended = parse_calibration(
+        stdout,
+        spec.calibration.target_speedup_percent,
+        result.log_ratio_sd,
+    )?;
     Ok((result, recommended))
 }
 
@@ -1837,13 +2021,26 @@ fn run_comparison(
         } else {
             "exploratory_per_candidate"
         };
+        validate_paired_plan(
+            stdout,
+            "AB",
+            expected_scope,
+            &spec.measure,
+            workload,
+            blocks,
+            design.order_seed,
+            &design.seeds,
+            spec.limits.subject_timeout_ms,
+            spec.limits.max_output_bytes,
+        )?;
         let parsed = parse_paired_result(stdout, "AB", expected_scope, &spec.measure, blocks)?;
         let result = ResultSummary {
             workload_id: workload.id.clone(),
             blocks,
             lower_95_one_sided_ratio: parsed.lower_95_one_sided_ratio,
             speedup_percent: parsed.speedup_percent,
-            evidence: parsed.evidence,
+            paired_evidence: parsed.evidence,
+            threshold_met: parsed.lower_95_one_sided_ratio > spec.decision.min_lower_bound_ratio,
         };
         context.emit(
             phase,
@@ -1931,6 +2128,76 @@ fn paired_stdout<'a>(output: &'a CapturedOutput, description: &str) -> Result<&'
         .map_err(|_| format!("{description} emitted non-UTF-8 stdout"))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_paired_plan(
+    stdout: &str,
+    expected_experiment: &str,
+    expected_scope: &str,
+    expected_measure: &str,
+    workload: &WorkloadSpec,
+    expected_blocks: usize,
+    expected_order_seed: u64,
+    expected_seeds: &[u64],
+    expected_timeout_ms: u64,
+    expected_max_output_bytes: usize,
+) -> Result<(), String> {
+    let lines = stdout
+        .lines()
+        .filter(|line| *line == "PLAN" || line.starts_with("PLAN "))
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        return Err(format!(
+            "paired output contained {} PLAN lines; expected exactly one",
+            lines.len()
+        ));
+    }
+    let line = lines[0];
+    let expected_requested = workload
+        .count
+        .checked_mul(workload.sessions)
+        .ok_or_else(|| format!("workload `{}` fixed work overflows", workload.id))?;
+    let expected_schedule = randomized_schedule(expected_blocks, expected_order_seed)
+        .iter()
+        .map(|order| order.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let expected_seed_list = expected_seeds
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let expected_order_source = format!("random:{expected_order_seed}");
+
+    let exact_fields = [
+        ("protocol", PAIRED_PROTOCOL_VERSION.to_owned()),
+        ("experiment", expected_experiment.to_owned()),
+        ("scope", expected_scope.to_owned()),
+        ("mode", expected_measure.to_owned()),
+        ("argument_transport", "direct".to_owned()),
+        ("count", workload.count.to_string()),
+        ("sessions", workload.sessions.to_string()),
+        ("requested", expected_requested.to_string()),
+        ("blocks", expected_blocks.to_string()),
+        ("order_source", expected_order_source),
+        ("schedule", expected_schedule),
+        ("seeds", expected_seed_list),
+        ("timeout_ms", expected_timeout_ms.to_string()),
+        (
+            "max_output_bytes_per_stream",
+            expected_max_output_bytes.to_string(),
+        ),
+    ];
+    for (key, expected) in exact_fields {
+        let actual = required_field(line, key)?;
+        if actual != expected {
+            return Err(format!(
+                "paired PLAN `{key}` value `{actual}` does not match `{expected}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_paired_result(
     stdout: &str,
     expected_experiment: &str,
@@ -1949,6 +2216,12 @@ fn parse_paired_result(
         ));
     }
     let line = lines[0];
+    let protocol = required_field(line, "protocol")?;
+    if protocol != PAIRED_PROTOCOL_VERSION {
+        return Err(format!(
+            "paired RESULT protocol `{protocol}` does not match `{PAIRED_PROTOCOL_VERSION}`"
+        ));
+    }
     let experiment = required_field(line, "experiment")?;
     if experiment != expected_experiment {
         return Err(format!(
@@ -1976,10 +2249,11 @@ fn parse_paired_result(
         ));
     }
     let lower_95_one_sided_ratio = parse_finite_field(line, "lower_95_one_sided_ratio")?;
-    if lower_95_one_sided_ratio <= 0.0 {
-        return Err("paired lower confidence bound must be positive".to_owned());
+    if lower_95_one_sided_ratio < 0.0 {
+        return Err("paired lower confidence bound must not be negative".to_owned());
     }
     let speedup_percent = parse_finite_field(line, "speedup_percent")?;
+    let mean_log_ratio = parse_finite_field(line, "mean_log_ratio")?;
     let log_ratio_sd = parse_finite_field(line, "log_ratio_sd")?;
     if log_ratio_sd < 0.0 {
         return Err("paired log-ratio standard deviation must not be negative".to_owned());
@@ -2007,15 +2281,32 @@ fn parse_paired_result(
             "paired confirmation RESULT has invalid evidence `{evidence}`"
         ));
     }
+    let expected_evidence = match expected_scope {
+        "exploratory_per_candidate" if lower_95_one_sided_ratio > 1.0 => Some("screen_positive"),
+        "exploratory_per_candidate" => Some("screen_inconclusive"),
+        "held_out_confirmation" if lower_95_one_sided_ratio > 1.0 => Some("candidate_faster"),
+        "held_out_confirmation" => Some("inconclusive"),
+        _ => None,
+    };
+    if expected_evidence.is_some_and(|expected| evidence != expected) {
+        return Err(format!(
+            "paired RESULT evidence `{evidence}` contradicts lower confidence bound {lower_95_one_sided_ratio}"
+        ));
+    }
     Ok(ParsedPairedResult {
         lower_95_one_sided_ratio,
         speedup_percent,
         evidence,
+        mean_log_ratio,
         log_ratio_sd,
     })
 }
 
-fn parse_calibration(stdout: &str) -> Result<usize, String> {
+fn parse_calibration(
+    stdout: &str,
+    expected_target_speedup_percent: f64,
+    observed_log_ratio_sd: f64,
+) -> Result<usize, String> {
     let lines = stdout
         .lines()
         .filter(|line| *line == "CALIBRATION" || line.starts_with("CALIBRATION "))
@@ -2026,21 +2317,48 @@ fn parse_calibration(stdout: &str) -> Result<usize, String> {
             lines.len()
         ));
     }
-    let blocks = parse_field::<usize>(lines[0], "approximate_blocks_for_80_percent_power")?;
+    let line = lines[0];
+    let protocol = required_field(line, "protocol")?;
+    if protocol != PAIRED_PROTOCOL_VERSION {
+        return Err(format!(
+            "paired CALIBRATION protocol `{protocol}` does not match `{PAIRED_PROTOCOL_VERSION}`"
+        ));
+    }
+    let target_speedup_percent = parse_finite_field(line, "target_speedup_percent")?;
+    if target_speedup_percent.to_bits() != expected_target_speedup_percent.to_bits() {
+        return Err(format!(
+            "paired calibration target {target_speedup_percent} does not match {expected_target_speedup_percent}"
+        ));
+    }
+    let blocks = parse_field::<usize>(line, "approximate_blocks_for_80_percent_power")?;
     if blocks == 0 {
         return Err("paired calibration recommended zero blocks".to_owned());
+    }
+    let expected_blocks =
+        approximate_power_blocks(observed_log_ratio_sd, expected_target_speedup_percent);
+    if blocks != expected_blocks {
+        return Err(format!(
+            "paired calibration recommended {blocks} blocks but the shared kernel computes {expected_blocks}"
+        ));
     }
     Ok(blocks)
 }
 
-fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+fn field<'a>(line: &'a str, key: &str) -> Result<Option<&'a str>, String> {
     let prefix = format!("{key}=");
-    line.split_whitespace()
-        .find_map(|token| token.strip_prefix(&prefix))
+    let mut values = line
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix(&prefix));
+    let value = values.next();
+    if values.next().is_some() {
+        Err(format!("paired output repeats `{key}`"))
+    } else {
+        Ok(value)
+    }
 }
 
 fn required_field<'a>(line: &'a str, key: &str) -> Result<&'a str, String> {
-    field(line, key).ok_or_else(|| format!("paired output missing `{key}`"))
+    field(line, key)?.ok_or_else(|| format!("paired output missing `{key}`"))
 }
 
 fn parse_field<T>(line: &str, key: &str) -> Result<T, String>
@@ -2073,9 +2391,16 @@ fn render_report(state: &CampaignState) -> String {
         "- Original baseline: `{}`\n",
         state.original_baseline
     ));
-    report.push_str(&format!("- Final baseline: `{}`\n", state.current_baseline));
     report.push_str(&format!(
-        "- Promotion threshold: lower 95% ratio `> {:.6}`\n",
+        "- Exploration baseline: `{}`\n",
+        state.current_baseline
+    ));
+    report.push_str(&format!(
+        "- Accepted baseline: `{}`\n",
+        state.accepted_baseline
+    ));
+    report.push_str(&format!(
+        "- Promotion threshold: lower 95% ratio `> {}`\n",
         state.min_lower_bound_ratio
     ));
     if let Some(error) = &state.error {
@@ -2086,15 +2411,23 @@ fn render_report(state: &CampaignState) -> String {
     if state.calibrations.is_empty() {
         report.push_str("No calibration completed.\n");
     } else {
-        report.push_str("| Workload | Planned | Recommended | Selected | Log-ratio SD |\n");
-        report.push_str("|---|---:|---:|---:|---:|\n");
+        report.push_str(
+            "| Workload | Planned | Recommended | Selected | Cap applied | Mean log-ratio | Log-ratio SD |\n",
+        );
+        report.push_str("|---|---:|---:|---:|---|---:|---:|\n");
         for calibration in &state.calibrations {
             report.push_str(&format!(
-                "| {} | {} | {} | {} | {:.9} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
                 calibration.workload_id,
                 calibration.planned_blocks,
                 calibration.recommended_blocks,
                 calibration.selected_blocks,
+                if calibration.block_cap_applied {
+                    "yes — under target power"
+                } else {
+                    "no"
+                },
+                calibration.mean_log_ratio,
                 calibration.log_ratio_sd
             ));
         }
@@ -2129,7 +2462,7 @@ fn render_report(state: &CampaignState) -> String {
         }
     }
 
-    report.push_str("\n## Baseline transitions\n\n");
+    report.push_str("\n## Exploration baseline transitions\n\n");
     if state.promotions.is_empty() {
         report.push_str("No candidate was promoted.\n");
     } else {
@@ -2145,8 +2478,11 @@ fn render_report(state: &CampaignState) -> String {
     match &state.confirmation {
         Some(confirmation) => {
             report.push_str(&format!(
-                "Decision: `{}` (`{}` vs `{}`).\n\n",
-                confirmation.decision, confirmation.final_baseline, confirmation.original_baseline
+                "Decision: `{}` (exploration winner `{}` vs original `{}`); accepted baseline: `{}`.\n\n",
+                confirmation.decision,
+                confirmation.exploration_winner,
+                confirmation.original_baseline,
+                confirmation.accepted_baseline,
             ));
             render_results_table(&mut report, &confirmation.workloads);
         }
@@ -2159,16 +2495,19 @@ fn render_report(state: &CampaignState) -> String {
 }
 
 fn render_results_table(report: &mut String, results: &[ResultSummary]) {
-    report.push_str("| Workload | Blocks | Lower 95% ratio | Speedup | Evidence |\n");
-    report.push_str("|---|---:|---:|---:|---|\n");
+    report.push_str(
+        "| Workload | Blocks | Lower 95% ratio | Speedup | Paired evidence | Threshold met |\n",
+    );
+    report.push_str("|---|---:|---:|---:|---|---|\n");
     for result in results {
         report.push_str(&format!(
-            "| {} | {} | {:.6} | {:.3}% | {} |\n",
+            "| {} | {} | {} | {}% | {} | {} |\n",
             result.workload_id,
             result.blocks,
             result.lower_95_one_sided_ratio,
             result.speedup_percent,
-            markdown_cell(&result.evidence)
+            markdown_cell(&result.paired_evidence),
+            if result.threshold_met { "yes" } else { "no" },
         ));
     }
     report.push('\n');
@@ -2275,10 +2614,11 @@ fn run() -> Result<(), String> {
     match execute(&spec, &mut context) {
         Ok(()) => {
             println!(
-                "campaign {}: {} (final baseline: {})",
+                "campaign {}: {} (exploration baseline: {}, accepted baseline: {})",
                 spec.id,
                 context.state.outcome.as_deref().unwrap_or("completed"),
-                context.state.current_baseline
+                context.state.current_baseline,
+                context.state.accepted_baseline,
             );
             Ok(())
         }
@@ -2316,8 +2656,27 @@ mod tests {
     }
 
     #[test]
+    fn gate_success_requires_a_versioned_identity_and_positive_work_record() {
+        let record = "optiwork-gate-v1\tstatus=equivalent\tartifact_id=c1\tworkload_id=main\tchecked_units=7\n";
+        assert_eq!(parse_gate_record(record, "c1", "main"), Ok(7));
+        assert!(parse_gate_record("", "c1", "main").is_err());
+        assert!(parse_gate_record(
+            "optiwork-gate-v1\tstatus=equivalent\tartifact_id=other\tworkload_id=main\tchecked_units=7\n",
+            "c1",
+            "main"
+        )
+        .is_err());
+        assert!(parse_gate_record(
+            "optiwork-gate-v1\tstatus=equivalent\tartifact_id=c1\tworkload_id=main\tchecked_units=0\n",
+            "c1",
+            "main"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn parses_complete_paired_result() {
-        let output = "RESULT experiment=AB scope=exploratory_per_candidate mode=scan valid_blocks=4 planned_blocks=4 invalid_blocks=0 mean_log_ratio=0.1 log_ratio_sd=0.02 speedup_ratio=1.1 speedup_percent=10.0 lower_95_one_sided_ratio=1.01 evidence=screen_positive\n";
+        let output = "RESULT protocol=optiwork-paired-v1 experiment=AB scope=exploratory_per_candidate mode=scan valid_blocks=4 planned_blocks=4 invalid_blocks=0 mean_log_ratio=0.1 log_ratio_sd=0.02 speedup_ratio=1.1 speedup_percent=10.0 lower_95_one_sided_ratio=1.01 evidence=screen_positive\n";
         let result =
             parse_paired_result(output, "AB", "exploratory_per_candidate", "scan", 4).unwrap();
         assert_eq!(result.lower_95_one_sided_ratio, 1.01);
@@ -2332,16 +2691,27 @@ mod tests {
             parse_paired_result(invalid, "AB", "exploratory_per_candidate", "scan", 4).is_err()
         );
         assert!(parse_paired_result("", "AB", "exploratory_per_candidate", "scan", 4).is_err());
+        let contradictory = "RESULT experiment=AB scope=exploratory_per_candidate mode=scan valid_blocks=4 planned_blocks=4 invalid_blocks=0 log_ratio_sd=0.1 speedup_percent=1 lower_95_one_sided_ratio=0.99 evidence=screen_positive\n";
+        assert!(
+            parse_paired_result(contradictory, "AB", "exploratory_per_candidate", "scan", 4)
+                .is_err()
+        );
+        let duplicate = "RESULT experiment=AB experiment=AA scope=exploratory_per_candidate mode=scan valid_blocks=4 planned_blocks=4 invalid_blocks=0 log_ratio_sd=0.1 speedup_percent=1 lower_95_one_sided_ratio=1.1 evidence=screen_positive\n";
+        assert!(
+            parse_paired_result(duplicate, "AB", "exploratory_per_candidate", "scan", 4).is_err()
+        );
     }
 
     #[test]
     fn parses_calibration_recommendation() {
+        let standard_deviation = 0.05;
+        let expected = approximate_power_blocks(standard_deviation, 3.0);
+        let record = format!(
+            "CALIBRATION protocol=optiwork-paired-v1 target_speedup_percent=3 approximate_blocks_for_80_percent_power={expected}\n"
+        );
         assert_eq!(
-            parse_calibration(
-                "CALIBRATION target_speedup_percent=3 approximate_blocks_for_80_percent_power=17\n"
-            )
-            .unwrap(),
-            17
+            parse_calibration(&record, 3.0, standard_deviation).unwrap(),
+            expected
         );
     }
 }

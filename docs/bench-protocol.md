@@ -59,6 +59,13 @@ Decision-bearing floating-point fields in `RESULT` (`log_ratio_sd`, ratios, and
 log ratios) are rendered with round-trip precision. A campaign therefore compares
 the computed confidence bound, not a display-rounded approximation of it.
 
+`PLAN`, `RESULT`, and `CALIBRATION` records carry
+`protocol=optiwork-paired-v1`. The campaign validates the plan's fixed work,
+block count, seeds, randomized schedule, argument transport, and process limits
+against its frozen invocation. It also recomputes A/A power sizing with the same
+`optikit` statistics kernel; a stale or malformed runner cannot silently change
+the experiment design.
+
 ## Safe argument and process handling
 
 Preferred runner options are repeatable direct arguments:
@@ -97,9 +104,11 @@ The bench has three modes that do **not** emit a fixed record and are never run
 in the timed path:
 
 - `--check <golden>` — equivalence gate: loads golden spans and requires exact
-  span-set equality for every pair. Prints `PASS impl=… pairs=… spans_checked`
-  or `FAIL …`. Exit `0` passes, exit `1` is a valid mismatch, and exit `2` is an
-  operational/configuration failure, matching the campaign gate contract.
+  span-set equality for every pair. The campaign also supplies gate artifact and
+  workload IDs. Success emits exactly one tab-separated `optiwork-gate-v1`
+  record with `status=equivalent`, both echoed IDs, and positive
+  `checked_units`; exit `1` is a valid mismatch, and exit `2` is an
+  operational/configuration failure. Exit `0` without the record is rejected.
 - `--count-of <corpus>` — prints the corpus byte count, so the runner/script can
   set `--count` exactly.
 - `--help` — usage.

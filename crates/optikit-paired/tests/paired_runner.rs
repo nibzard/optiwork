@@ -119,7 +119,10 @@ fn ab_reports_exact_speedup_with_screen_positive_evidence() {
     ]);
     assert!(output.status.success(), "stderr: {stderr}");
     // The preregistered plan must be printed before any observation.
-    assert!(stdout.starts_with("PLAN experiment=AB"), "stdout: {stdout}");
+    assert!(
+        stdout.starts_with("PLAN protocol=optiwork-paired-v1 experiment=AB"),
+        "stdout: {stdout}"
+    );
     // Candidate elapsed is exactly half of baseline, so the ratio is exactly 2
     // in every block: zero variance, and the lower bound equals the estimate.
     assert!(stdout.contains("valid_blocks=2"), "stdout: {stdout}");

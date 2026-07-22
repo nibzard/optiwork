@@ -38,7 +38,7 @@ overhead is slower than tight backtracking on benign input, so it regresses on
 `main`. The two-corpus rule refuses to promote a specialization that one corpus
 penalizes. The prefilter then wins on both: SIMD-skipping to literal hits on the
 large haystack, and inheriting the linear Pike VM on pathological patterns. The
-current campaign preserves that candidate order but uses each accepted candidate
+current campaign preserves that candidate order but uses each provisionally promoted candidate
 as the next baseline and reserves fresh seeds for one final
 optimized-versus-original confirmation.
 

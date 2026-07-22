@@ -92,6 +92,7 @@ name = "optikit-campaign"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "optikit",
  "serde",
  "serde_json",
  "sha2",

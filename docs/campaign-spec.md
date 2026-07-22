@@ -60,7 +60,8 @@ The accepted top-level version is `optiwork-campaign-v1`.
   "calibration": {
     "order_seed": 731,
     "seeds": [101, 202, 303],
-    "target_speedup_percent": 3.0
+    "target_speedup_percent": 3.0,
+    "max_abs_mean_log_ratio": 0.03
   },
   "exploration": {
     "order_seed": 1,
@@ -79,13 +80,22 @@ The accepted top-level version is `optiwork-campaign-v1`.
 Artifact `args` precede workload arguments. A gate command is:
 
 ```text
-<artifact.binary> <artifact.args...> <workload.gate_args...>
+<artifact.binary> <artifact.args...> <workload.args...> <workload.gate_args...>
+  --optiwork-gate-artifact-id <artifact.id>
+  --optiwork-gate-workload-id <workload.id>
 ```
+
+`workload.args` is deliberately common to correctness and timing;
+`workload.gate_args` contains only gate-specific additions. This makes it
+impossible to accidentally validate one corpus/configuration and time another.
 
 The gate exit contract is explicit: `0` means equivalent, `1` means a valid
 equivalence mismatch, and any other status (including a signal or launch error)
-is an operational failure. Only exit `1` becomes the candidate outcome
-`gate_failed`; operational failures abort the campaign.
+is an operational failure. Exit `0` is accepted only with exactly one
+`optiwork-gate-v1` stdout record echoing the supplied artifact/workload IDs,
+`status=equivalent`, and a positive `checked_units` count. Only a valid exit `1`
+becomes the candidate outcome `gate_failed`; launch, protocol, and other
+operational failures abort the campaign.
 
 A timed observation receives the paired runner's protocol arguments (`--measure`,
 `--seed`, `--count`, and `--sessions`) followed by artifact arguments and then
@@ -102,6 +112,13 @@ campaign is launched.
 strict `>` comparison. Higher values express a preregistered minimum convincing
 speedup; values below `1.0` are rejected because they would allow a measured
 regression to be labeled as an optimization.
+
+`calibration.max_abs_mean_log_ratio` is the preregistered maximum tolerated A/A
+label bias. Calibration aborts if the same artifact's absolute mean log-ratio
+exceeds it. The driver also recomputes the power recommendation with the shared
+statistics kernel. If the recommendation exceeds a workload's `max_blocks`, the
+frozen cap is honored but the run record explicitly marks the design as under
+the requested target power.
 
 Child processes do not inherit the campaign's ambient environment. The driver
 clears it and installs exactly the string keys and values in `environment` for
@@ -127,7 +144,8 @@ Validation finishes before measurement and rejects:
 - empty workloads or candidates;
 - zero counts, sessions, block limits, or seed lists;
 - a block range where `min_blocks > max_blocks`;
-- a non-finite/non-positive target effect or a decision threshold below `1.0`;
+- a non-finite/non-positive target effect or A/A bias limit, or a decision
+  threshold below `1.0`;
 - zero/excessive process limits or invalid environment keys/values;
 - reused exploration/confirmation seeds; or
 - reused phase order seeds.
@@ -156,14 +174,16 @@ turn the campaign into a failed run.
 Before each candidate comparison the state identifies the current baseline. A
 promotion event records `from` and `to`, making it possible to verify that the
 next comparison used the promoted artifact. Confirmation names both the final
-artifact and the unchanged original baseline.
+exploration artifact and the unchanged original baseline. State also records an
+`accepted_baseline`: it remains original until the one-shot confirmation passes,
+even though `current_baseline` preserves the provisional exploration ladder.
 
 ## Run-directory contract
 
 | path | purpose |
 |---|---|
 | `spec.json` | exact input spec bytes copied before execution |
-| `provenance.json` | SHA-256 identities, frozen child environment, working directory, OS, architecture, and available parallelism |
+| `provenance.json` | SHA-256 identities of the campaign driver, paired runner, subjects, spec, and declared inputs; frozen child environment; working directory; OS; architecture; and available parallelism |
 | `state.json` | atomically replaced snapshot of the latest campaign phase and baseline |
 | `events.jsonl` | lossless ordered event stream with sequence, timestamp, campaign, phase, type, and payload |
 | `raw/` | unique stdout/stderr files for every gate and paired invocation |

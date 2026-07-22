@@ -34,7 +34,7 @@
     {
       "id": "main",
       "args": ["--corpus", "corpora/main.bin"],
-      "gate_args": ["--check", "corpora/main.golden", "--corpus", "corpora/main.bin"],
+      "gate_args": ["--check", "corpora/main.golden"],
       "artifacts": ["corpora/main.bin", "corpora/main.golden"],
       "count": 8377,
       "sessions": 30,
@@ -45,7 +45,7 @@
     {
       "id": "pathological",
       "args": ["--corpus", "corpora/pathological.bin"],
-      "gate_args": ["--check", "corpora/pathological.golden", "--corpus", "corpora/pathological.bin"],
+      "gate_args": ["--check", "corpora/pathological.golden"],
       "artifacts": ["corpora/pathological.bin", "corpora/pathological.golden"],
       "count": 150,
       "sessions": 3,
@@ -57,7 +57,8 @@
   "calibration": {
     "order_seed": 731,
     "seeds": [101, 202, 303],
-    "target_speedup_percent": 3.0
+    "target_speedup_percent": 3.0,
+    "max_abs_mean_log_ratio": 0.03
   },
   "exploration": {
     "order_seed": 1,

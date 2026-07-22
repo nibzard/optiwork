@@ -31,6 +31,7 @@ const DEFAULT_BLOCKS: usize = 16;
 const DEFAULT_WORK_SEED: u64 = 42;
 const DEFAULT_ORDER_SEED: u64 = 1;
 const DEFAULT_TARGET_SPEEDUP_PERCENT: f64 = 3.0;
+const PAIRED_PROTOCOL_VERSION: &str = "optiwork-paired-v1";
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -844,7 +845,8 @@ fn execute(arguments: &Arguments) -> Result<bool, String> {
         .unwrap_or_else(|| "explicit".to_owned());
     let plan_args = arguments.plan_args();
     println!(
-        "PLAN experiment={} scope={} mode={} {} count={} sessions={} requested={} blocks={} order_source={} schedule={} seeds={} timeout_ms={} max_output_bytes_per_stream={}",
+        "PLAN protocol={} experiment={} scope={} mode={} {} count={} sessions={} requested={} blocks={} order_source={} schedule={} seeds={} timeout_ms={} max_output_bytes_per_stream={}",
+        PAIRED_PROTOCOL_VERSION,
         if arguments.calibration { "AA" } else { "AB" },
         scope,
         arguments.measure,
@@ -933,7 +935,8 @@ fn execute(arguments: &Arguments) -> Result<bool, String> {
     let Some(summary) = summarize(&log_ratios) else {
         if invalid_blocks != 0 {
             println!(
-                "RESULT experiment={} scope={} mode={} valid_blocks={} planned_blocks={} invalid_blocks={} evidence=invalid_design",
+                "RESULT protocol={} experiment={} scope={} mode={} valid_blocks={} planned_blocks={} invalid_blocks={} evidence=invalid_design",
+                PAIRED_PROTOCOL_VERSION,
                 if arguments.calibration { "AA" } else { "AB" },
                 scope,
                 arguments.measure,
@@ -949,7 +952,8 @@ fn execute(arguments: &Arguments) -> Result<bool, String> {
         ));
     };
     println!(
-        "RESULT experiment={} scope={} mode={} valid_blocks={} planned_blocks={} invalid_blocks={} mean_log_ratio={} log_ratio_sd={} speedup_ratio={} speedup_percent={} lower_95_one_sided_ratio={} lower_95_one_sided_percent={} evidence={}",
+        "RESULT protocol={} experiment={} scope={} mode={} valid_blocks={} planned_blocks={} invalid_blocks={} mean_log_ratio={} log_ratio_sd={} speedup_ratio={} speedup_percent={} lower_95_one_sided_ratio={} lower_95_one_sided_percent={} evidence={}",
+        PAIRED_PROTOCOL_VERSION,
         if arguments.calibration { "AA" } else { "AB" },
         scope,
         arguments.measure,
@@ -971,8 +975,9 @@ fn execute(arguments: &Arguments) -> Result<bool, String> {
     );
     if arguments.calibration && invalid_blocks == 0 {
         println!(
-            "CALIBRATION target_speedup_percent={:.3} approximate_blocks_for_80_percent_power={}",
-            arguments.target_speedup_percent,
+            "CALIBRATION protocol={} target_speedup_percent={} approximate_blocks_for_80_percent_power={}",
+            PAIRED_PROTOCOL_VERSION,
+            wire_f64(arguments.target_speedup_percent),
             approximate_power_blocks(summary.log_ratio_sd, arguments.target_speedup_percent),
         );
     }

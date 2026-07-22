@@ -22,10 +22,30 @@ if [ -n "${FAKE_BENCH_LOG:-}" ]; then
 fi
 
 artifact=
+workload=
+gate_artifact_id=
+gate_workload_id=
+gate_requested=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --artifact)
       artifact=${2:-}
+      shift 2
+      ;;
+    --workload)
+      workload=${2:-}
+      shift 2
+      ;;
+    --gate)
+      gate_requested=1
+      shift
+      ;;
+    --optiwork-gate-artifact-id)
+      gate_artifact_id=${2:-}
+      shift 2
+      ;;
+    --optiwork-gate-workload-id)
+      gate_workload_id=${2:-}
       shift 2
       ;;
     *)
@@ -55,7 +75,17 @@ if [ "$artifact" = "noisy" ]; then
     i=$((i + 1))
   done
 fi
-printf 'PASS artifact=%s pairs=1 spans_checked\n' "$artifact"
+if [ "$artifact" = "no-record" ]; then
+  exit 0
+fi
+if [ "$gate_requested" -ne 1 ] || [ "$workload" != "main" ] || \
+   [ "$gate_artifact_id" != "$artifact" ] || [ "$gate_workload_id" != "$workload" ]; then
+  printf 'invalid gate handshake artifact=%s workload=%s gate_artifact=%s gate_workload=%s\n' \
+    "$artifact" "$workload" "$gate_artifact_id" "$gate_workload_id" >&2
+  exit 2
+fi
+printf 'optiwork-gate-v1\tstatus=equivalent\tartifact_id=%s\tworkload_id=%s\tchecked_units=1\n' \
+  "$gate_artifact_id" "$gate_workload_id"
 "#;
 
 // The campaign must forward each artifact/workload token through repeated
@@ -82,6 +112,14 @@ candidate_needs_workload=0
 subject_needs_workload=0
 blocks=2
 target_speedup=3.0
+measure=scan
+count=0
+sessions=0
+order_seed=0
+seeds=
+timeout_ms=0
+max_output_bytes=0
+direct_args=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -89,9 +127,20 @@ while [ "$#" -gt 0 ]; do
       experiment=AA
       shift 2
       ;;
-    --baseline|--candidate|--measure|--count|--sessions|--order-seed|--seed|--timeout-ms|--max-output-bytes)
+    --baseline|--candidate)
       shift 2
       ;;
+    --measure) measure=${2:-}; shift 2;;
+    --count) count=${2:-0}; shift 2;;
+    --sessions) sessions=${2:-0}; shift 2;;
+    --order-seed) order_seed=${2:-0}; shift 2;;
+    --seed)
+      if [ -z "$seeds" ]; then seeds=${2:-}; else seeds="$seeds,${2:-}"; fi
+      shift 2
+      ;;
+    --timeout-ms) timeout_ms=${2:-0}; shift 2;;
+    --max-output-bytes) max_output_bytes=${2:-0}; shift 2;;
+    --direct-args) direct_args=1; shift;;
     --blocks)
       blocks=${2:-2}
       shift 2
@@ -186,10 +235,23 @@ if [ -n "${FAKE_PAIRED_FAIL_ARTIFACT:-}" ] && \
   exit 9
 fi
 
+case "$order_seed" in
+  731) schedule=ABBA,ABBA;;
+  11) schedule=BAAB,BAAB;;
+  77) schedule=BAAB,ABBA;;
+  *) schedule=ABBA,BAAB;;
+esac
+requested=$((count * sessions))
+if [ "$direct_args" -ne 1 ]; then
+  printf 'campaign did not select direct argument transport\n' >&2
+  exit 9
+fi
+
 if [ "$experiment" = "AA" ]; then
-  printf 'PLAN experiment=AA scope=calibration mode=scan count=10 sessions=2 blocks=%s\n' "$blocks"
-  printf 'RESULT experiment=AA scope=calibration mode=scan valid_blocks=%s planned_blocks=%s invalid_blocks=0 mean_log_ratio=0.000000000 log_ratio_sd=0.010000000 speedup_ratio=1.000000 speedup_percent=0.000 lower_95_one_sided_ratio=0.990000 lower_95_one_sided_percent=-1.000 evidence=calibration_only\n' "$blocks" "$blocks"
-  printf 'CALIBRATION target_speedup_percent=%s approximate_blocks_for_80_percent_power=3\n' "$target_speedup"
+  printf 'PLAN protocol=optiwork-paired-v1 experiment=AA scope=calibration mode=%s argument_transport=direct baseline_argv=[] candidate_argv=[] count=%s sessions=%s requested=%s blocks=%s order_source=random:%s schedule=%s seeds=%s timeout_ms=%s max_output_bytes_per_stream=%s\n' \
+    "$measure" "$count" "$sessions" "$requested" "$blocks" "$order_seed" "$schedule" "$seeds" "$timeout_ms" "$max_output_bytes"
+  printf 'RESULT protocol=optiwork-paired-v1 experiment=AA scope=calibration mode=scan valid_blocks=%s planned_blocks=%s invalid_blocks=0 mean_log_ratio=0.000000000 log_ratio_sd=0.010000000 speedup_ratio=1.000000 speedup_percent=0.000 lower_95_one_sided_ratio=0.990000 lower_95_one_sided_percent=-1.000 evidence=calibration_only\n' "$blocks" "$blocks"
+  printf 'CALIBRATION protocol=optiwork-paired-v1 target_speedup_percent=%s approximate_blocks_for_80_percent_power=2\n' "$target_speedup"
   exit 0
 fi
 
@@ -203,8 +265,9 @@ else
   lower=1.200000
   evidence=screen_positive
 fi
-printf 'PLAN experiment=AB scope=%s mode=scan count=10 sessions=2 blocks=%s\n' "$result_scope" "$blocks"
-printf 'RESULT experiment=AB scope=%s mode=scan valid_blocks=%s planned_blocks=%s invalid_blocks=0 mean_log_ratio=0.095310180 log_ratio_sd=0.010000000 speedup_ratio=1.100000 speedup_percent=10.000 lower_95_one_sided_ratio=%s lower_95_one_sided_percent=10.000 evidence=%s\n' \
+printf 'PLAN protocol=optiwork-paired-v1 experiment=AB scope=%s mode=%s argument_transport=direct baseline_argv=[] candidate_argv=[] count=%s sessions=%s requested=%s blocks=%s order_source=random:%s schedule=%s seeds=%s timeout_ms=%s max_output_bytes_per_stream=%s\n' \
+  "$result_scope" "$measure" "$count" "$sessions" "$requested" "$blocks" "$order_seed" "$schedule" "$seeds" "$timeout_ms" "$max_output_bytes"
+printf 'RESULT protocol=optiwork-paired-v1 experiment=AB scope=%s mode=scan valid_blocks=%s planned_blocks=%s invalid_blocks=0 mean_log_ratio=0.095310180 log_ratio_sd=0.010000000 speedup_ratio=1.100000 speedup_percent=10.000 lower_95_one_sided_ratio=%s lower_95_one_sided_percent=10.000 evidence=%s\n' \
   "$result_scope" "$blocks" "$blocks" "$lower" "$evidence"
 "#;
 
@@ -285,6 +348,7 @@ impl Fixture {
                 "order_seed": 731,
                 "seeds": [1],
                 "target_speedup_percent": 3.0,
+                "max_abs_mean_log_ratio": 0.03,
             },
             "exploration": {
                 "order_seed": 11,
@@ -443,6 +507,20 @@ fn assert_evidence_bundle(fixture: &Fixture) {
         provenance["host"].is_object(),
         "host provenance must be separate from the child environment: {provenance}"
     );
+    assert!(
+        provenance["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["kind"] == "campaign_driver"
+                    && entry["id"] == "optikit-campaign"
+                    && entry["sha256"]
+                        .as_str()
+                        .is_some_and(|hash| hash.len() == 64)
+            }),
+        "campaign driver is missing from provenance: {provenance}"
+    );
     let raw = fixture.run_dir.join("raw");
     assert!(raw.is_dir(), "missing raw evidence dir: {}", raw.display());
     assert!(
@@ -481,6 +559,15 @@ fn campaign_promotes_then_rejects_and_confirms_final_against_original() {
     assert!(output.status.success(), "{}", output_text(&output));
     assert_evidence_bundle(&fixture);
 
+    let gates = fixture.bench_lines();
+    assert!(
+        gates.iter().all(|line| {
+            line.contains("--workload main")
+                && line.contains("--optiwork-gate-artifact-id")
+                && line.contains("--optiwork-gate-workload-id main")
+        }),
+        "gate invocations did not share timed workload args and identity handshake: {gates:#?}"
+    );
     let paired = fixture.paired_lines();
     assert!(
         paired.iter().all(|line| {
@@ -520,6 +607,8 @@ fn campaign_promotes_then_rejects_and_confirms_final_against_original() {
     );
 
     let state = fixture.state();
+    assert_eq!(state["current_baseline"], "c1", "state: {state}");
+    assert_eq!(state["accepted_baseline"], "c1", "state: {state}");
     assert!(json_contains_text(&state, "c1"), "state: {state}");
     assert!(json_contains_text(&state, "complete"), "state: {state}");
     let events = fixture.events();
@@ -622,6 +711,52 @@ fn scientific_rejections_complete_successfully_without_confirmation() {
 }
 
 #[test]
+fn inconclusive_confirmation_keeps_the_original_as_the_accepted_baseline() {
+    let mut fixture = Fixture::new("negative-confirmation", &["c1"]);
+    // Exploration clears this threshold (1.20), while held-out confirmation is
+    // merely faster than 1.0 (1.10) and must not be accepted.
+    fixture.spec["decision"]["min_lower_bound_ratio"] = json!(1.15);
+    fixture.rewrite_spec();
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_evidence_bundle(&fixture);
+
+    let state = fixture.state();
+    assert_eq!(
+        state["outcome"], "confirmation_inconclusive",
+        "state: {state}"
+    );
+    assert_eq!(state["current_baseline"], "c1", "state: {state}");
+    assert_eq!(state["accepted_baseline"], "base", "state: {state}");
+    assert_eq!(
+        state["confirmation"]["exploration_winner"], "c1",
+        "state: {state}"
+    );
+    assert_eq!(
+        state["confirmation"]["accepted_baseline"], "base",
+        "state: {state}"
+    );
+    assert_eq!(
+        state["confirmation"]["workloads"][0]["paired_evidence"], "candidate_faster",
+        "state: {state}"
+    );
+    assert_eq!(
+        state["confirmation"]["workloads"][0]["threshold_met"], false,
+        "state: {state}"
+    );
+    let report = fs::read_to_string(fixture.run_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains("Accepted baseline: `base`"),
+        "report: {report}"
+    );
+    assert!(
+        report.contains("accepted baseline: `base`"),
+        "report: {report}"
+    );
+}
+
+#[test]
 fn paired_operational_failure_aborts_and_is_not_a_scientific_rejection() {
     let mut fixture = Fixture::new("paired-failure", &["opfail"]);
     fixture.set_child_environment("FAKE_PAIRED_FAIL_ARTIFACT", "opfail");
@@ -689,6 +824,29 @@ fn gate_operational_failure_aborts_and_is_not_a_candidate_rejection() {
             json_contains_text(event, "broken") && json_contains_text(event, "gate_failed")
         }),
         "operational gate failure was mislabeled: {events:#?}"
+    );
+}
+
+#[test]
+fn exit_zero_without_versioned_gate_evidence_aborts() {
+    let fixture = Fixture::new("missing-gate-record", &["no-record"]);
+    let output = fixture.run(&[]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_evidence_bundle(&fixture);
+
+    let state = fixture.state();
+    assert_eq!(state["status"], "failed", "state: {state}");
+    assert_eq!(state["outcome"], "operational_failure", "state: {state}");
+    assert!(
+        json_contains_text(&state, "invalid success evidence"),
+        "state: {state}"
+    );
+    assert!(
+        !fixture
+            .paired_lines()
+            .iter()
+            .any(|line| line.contains("candidate=no-record")),
+        "a candidate without gate evidence reached timing"
     );
 }
 

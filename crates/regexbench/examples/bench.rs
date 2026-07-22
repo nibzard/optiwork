@@ -17,6 +17,7 @@ use regexbench::{Impl, Regex, Span};
 /// optikit) so this binary stays free of harness dependencies; a mismatch is caught
 /// by the runner's version check.
 const FIXED_RECORD_VERSION: &str = "optiwork-fixed-v1";
+const GATE_RECORD_VERSION: &str = "optiwork-gate-v1";
 
 const USAGE: &str = "\
 regexbench bench binary (optiwork subject)
@@ -25,7 +26,8 @@ Timed fixed-work run (driven by optikit-paired):
   bench --measure <mode> --seed <n> --sessions <n> --count <n> --subject-args \"--impl <name> --corpus <path>\"
 
 Equivalence gate:
-  bench --check <golden> --impl <name> --corpus <path>
+  bench --check <golden> --impl <name> --corpus <path> \
+    --optiwork-gate-artifact-id <id> --optiwork-gate-workload-id <id>
 
 Corpus byte count (for the campaign to size --count):
   bench --count-of <path>";
@@ -40,6 +42,8 @@ struct Config {
     sessions: Option<u64>,
     count: Option<u64>,
     subject_args: Option<String>,
+    gate_artifact_id: Option<String>,
+    gate_workload_id: Option<String>,
 }
 
 impl Config {
@@ -54,6 +58,8 @@ impl Config {
             sessions: None,
             count: None,
             subject_args: None,
+            gate_artifact_id: None,
+            gate_workload_id: None,
         }
     }
 }
@@ -98,6 +104,8 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 )
             }
             "--subject-args" => config.subject_args = Some(take()?),
+            "--optiwork-gate-artifact-id" => config.gate_artifact_id = Some(take()?),
+            "--optiwork-gate-workload-id" => config.gate_workload_id = Some(take()?),
             other => return Err(format!("unknown option `{other}`")),
         }
         i += 1;
@@ -250,8 +258,19 @@ fn run_check(config: &Config) -> Result<bool, String> {
         .check
         .as_deref()
         .ok_or_else(|| "gate run requires `--check`".to_owned())?;
+    let gate_artifact_id = config
+        .gate_artifact_id
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--optiwork-gate-artifact-id`".to_owned())?;
+    let gate_workload_id = config
+        .gate_workload_id
+        .as_deref()
+        .ok_or_else(|| "gate run requires `--optiwork-gate-workload-id`".to_owned())?;
 
     let corpus = load_corpus(corpus_path)?;
+    if corpus.is_empty() {
+        return Err("gate corpus contains no pairs".to_owned());
+    }
     let golden_bytes =
         fs::read(golden_path).map_err(|e| format!("could not read golden `{golden_path}`: {e}"))?;
     let golden = deserialize_golden(&golden_bytes)?;
@@ -283,7 +302,10 @@ fn run_check(config: &Config) -> Result<bool, String> {
         }
     }
     if mismatches == 0 {
-        println!("PASS impl={impl_name} pairs={} spans_checked", corpus.len());
+        println!(
+            "{GATE_RECORD_VERSION}\tstatus=equivalent\tartifact_id={gate_artifact_id}\tworkload_id={gate_workload_id}\tchecked_units={}",
+            corpus.len()
+        );
         Ok(true)
     } else {
         eprintln!(

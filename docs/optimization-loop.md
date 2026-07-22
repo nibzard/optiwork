@@ -71,6 +71,12 @@ valid equivalence mismatch, and every other exit status or signal is operational
 This prevents a missing fixture, crashed gate, or invalid invocation from being
 reported as a scientifically rejected candidate.
 
+The timed workload arguments are also passed to the gate, followed by only its
+gate-specific additions. A successful gate must emit one versioned
+`optiwork-gate-v1` record that echoes the artifact and workload identities and a
+positive checked-work count. Exit zero without that evidence is operationally
+invalid, so a binary cannot pass merely by ignoring an unknown gate option.
+
 For the showcase the gate compares exact match spans with committed golden
 vectors:
 
@@ -96,6 +102,12 @@ chosen_blocks = clamp(recommended_blocks, min_blocks, max_blocks)
 
 before observing any candidate. An invalid A/A design or failed observation
 aborts the campaign. It cannot silently become positive calibration evidence.
+The campaign also rejects an A/A mean log-ratio outside the frozen bias limit,
+validates the paired plan echo, and independently recomputes the recommended
+block count with the shared statistics kernel. If `max_blocks` caps the
+recommendation, state and report mark that workload as under the requested
+target power; the confidence-bound decision remains conservative, but a likely
+false negative is no longer hidden.
 
 ## 4. Explore with cumulative promotion
 
@@ -129,7 +141,9 @@ block counts; it cannot tune, retry, or promote anything.
 
 If nothing was promoted, the campaign records that confirmation was not
 applicable. A valid confirmation that misses the threshold is still a completed
-campaign with a negative confirmatory result.
+campaign with a negative confirmatory result. The exploratory winner remains in
+the ladder history, but the accepted baseline stays original unless confirmation
+passes; an inconclusive candidate is never presented as deployable.
 
 ## Outcome semantics
 
