@@ -10,7 +10,7 @@
     "paired_timeout_ms": 43200000,
     "max_output_bytes": 16777216
   },
-  "max_candidates": 2,
+  "max_candidates": 3,
   "baseline": {
     "id": "naive",
     "binary": "target/release/optiwork-artifacts/regex-naive-bench",
@@ -28,6 +28,12 @@
       "binary": "target/release/optiwork-artifacts/regex-prefilter-bench",
       "args": ["--impl", "prefilter"],
       "hypothesis": "A SIMD literal-prefix scan jumps to candidate starts, followed by anchored linear verification."
+    },
+    {
+      "id": "lazy_dfa",
+      "binary": "target/release/optiwork-artifacts/regex-lazy-dfa-bench",
+      "args": ["--impl", "lazy_dfa"],
+      "hypothesis": "A flat-table lazy DFA with a cross-call cache removes the scalar Pike-VM thread walk on non-literal pairs, while the memchr prefilter is kept for literal-prefix pairs."
     }
   ],
   "workloads": [

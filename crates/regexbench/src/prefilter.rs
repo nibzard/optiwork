@@ -64,7 +64,7 @@ fn find_with_prefix(
 /// The maximal run of single literal bytes at the very start of the pattern, or
 /// `None` if the pattern does not begin with a literal. A single-character prefix
 /// is returned as a one-byte vector; callers require length ≥ 2 before activating.
-fn leading_literal_prefix(ast: &Node) -> Option<Vec<u8>> {
+pub(crate) fn leading_literal_prefix(ast: &Node) -> Option<Vec<u8>> {
     let parts: &[Node] = match ast {
         Node::Concat(parts) => parts,
         Node::Class(class) => return class.single_byte().map(|b| vec![b]),

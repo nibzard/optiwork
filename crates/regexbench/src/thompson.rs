@@ -24,7 +24,7 @@
 use crate::{Node, Regex, Span};
 
 #[derive(Clone, Debug)]
-enum Inst {
+pub(crate) enum Inst {
     /// Consume one byte in the class, then fall through to the next instruction.
     /// The class is boxed so a program is a compact array of small instructions
     /// (cache-friendly for the Pike VM's per-byte state walk).
@@ -61,6 +61,12 @@ impl Program {
         emit(ast, &mut insts);
         insts.push(Inst::Match);
         Self { insts }
+    }
+
+    /// Read-only access to the instruction array. Shared with the lazy DFA, which
+    /// reuses this NFA as the single source of truth instead of recompiling.
+    pub(crate) fn insts(&self) -> &[Inst] {
+        &self.insts
     }
 }
 
