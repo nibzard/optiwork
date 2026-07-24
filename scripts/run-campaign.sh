@@ -44,6 +44,7 @@ install -m 0755 "$BENCH" "$ARTIFACT_DIR/regex-naive-bench"
 install -m 0755 "$BENCH" "$ARTIFACT_DIR/regex-thompson-bench"
 install -m 0755 "$BENCH" "$ARTIFACT_DIR/regex-prefilter-bench"
 install -m 0755 "$BENCH" "$ARTIFACT_DIR/regex-lazy-dfa-bench"
+install -m 0755 "$BENCH" "$ARTIFACT_DIR/regex-flat-dfa-bench"
 
 for input in \
   corpora/main.bin \

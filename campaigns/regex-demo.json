@@ -10,7 +10,7 @@
     "paired_timeout_ms": 43200000,
     "max_output_bytes": 16777216
   },
-  "max_candidates": 3,
+  "max_candidates": 4,
   "baseline": {
     "id": "naive",
     "binary": "target/release/optiwork-artifacts/regex-naive-bench",
@@ -34,6 +34,12 @@
       "binary": "target/release/optiwork-artifacts/regex-lazy-dfa-bench",
       "args": ["--impl", "lazy_dfa"],
       "hypothesis": "A flat-table lazy DFA with a cross-call cache removes the scalar Pike-VM thread walk on non-literal pairs, while the memchr prefilter is kept for literal-prefix pairs."
+    },
+    {
+      "id": "flat_dfa",
+      "binary": "target/release/optiwork-artifacts/regex-flat-dfa-bench",
+      "args": ["--impl", "flat_dfa"],
+      "hypothesis": "Caching the literal/anchor routing verdicts on the DFA and reusing the cached_find scratch buffers cut the per-call constant factor that dominates the tiny non-literal tail pairs, with the same DFA core as lazy_dfa."
     }
   ],
   "workloads": [

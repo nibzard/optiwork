@@ -21,6 +21,7 @@
 //! produced by `find_all`. They differ only in time/memory on adversarial inputs.
 
 pub mod corpus;
+pub mod flat_dfa;
 pub mod lazy_dfa;
 pub mod naive;
 #[cfg(feature = "oracle")]
@@ -409,6 +410,7 @@ pub enum Impl {
     Thompson,
     Prefilter,
     LazyDfa,
+    FlatDfa,
 }
 
 impl Impl {
@@ -418,8 +420,9 @@ impl Impl {
             "thompson" => Ok(Self::Thompson),
             "prefilter" => Ok(Self::Prefilter),
             "lazy_dfa" => Ok(Self::LazyDfa),
+            "flat_dfa" => Ok(Self::FlatDfa),
             other => Err(format!(
-                "unknown impl `{other}` (expected naive|thompson|prefilter|lazy_dfa)"
+                "unknown impl `{other}` (expected naive|thompson|prefilter|lazy_dfa|flat_dfa)"
             )),
         }
     }
@@ -430,6 +433,7 @@ impl Impl {
             Self::Thompson => "thompson",
             Self::Prefilter => "prefilter",
             Self::LazyDfa => "lazy_dfa",
+            Self::FlatDfa => "flat_dfa",
         }
     }
 
@@ -440,6 +444,7 @@ impl Impl {
             Self::Thompson => thompson::find_all(re, input, out),
             Self::Prefilter => prefilter::find_all(re, input, out),
             Self::LazyDfa => lazy_dfa::find_all(re, input, out),
+            Self::FlatDfa => flat_dfa::find_all(re, input, out),
         }
     }
 }
